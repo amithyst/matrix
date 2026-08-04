@@ -341,7 +341,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--pico-gamepad-bridge",
         action="store_true",
-        help="Forward PICO sticks into the shared Matrix game-input state machine",
+        help=(
+            "Merge native PICO planner/pose input with Matrix desktop game input "
+            "through one SONIC publisher"
+        ),
     )
     parser.add_argument("--pico-gamepad-python", default=None)
     parser.add_argument("--pico-gamepad-status-file", type=Path)
@@ -2877,6 +2880,13 @@ class NativePlannerClient:
             delta_heading=command.delta_heading_rad,
         )
 
+    def send_raw(self, payload: bytes) -> None:
+        """Forward one already-encoded native SONIC manager message."""
+
+        if not isinstance(payload, bytes) or not payload:
+            raise TypeError("native SONIC payload must be non-empty bytes")
+        self._socket.send(payload)
+
     def close(self) -> None:
         stop_error = None
         try:
@@ -2898,6 +2908,111 @@ class NativePlannerClient:
             self._socket.close(linger=0)
         if stop_error is not None:
             raise RuntimeError(f"failed to send native planner stop: {stop_error}")
+
+
+class SharedPicoInputRouter:
+    """Merge native PICO state-machine output into Matrix's single ZMQ publisher.
+
+    The native manager owns PICO semantics (A+X pose toggle, A+B/X+Y mode
+    selection and right-stick body yaw) on a private loopback port.  Matrix
+    remains the only publisher seen by the deploy binary, so desktop and PICO
+    can never race as two independent SONIC control sources.
+    """
+
+    HEADER_SIZE = 1280
+
+    def __init__(self, endpoint: str, *, zmq_module: Any) -> None:
+        self._zmq = zmq_module
+        self._socket = zmq_module.Context.instance().socket(zmq_module.SUB)
+        self._socket.setsockopt(zmq_module.LINGER, 0)
+        self._socket.setsockopt(zmq_module.SUBSCRIBE, b"")
+        self._socket.connect(endpoint)
+        self.endpoint = endpoint
+        self.mode = "off"
+        self.messages_received = 0
+        self.messages_forwarded = 0
+        self.desktop_override_frames = 0
+        self.last_command: bytes | None = None
+        self.last_planner: bytes | None = None
+        self.last_pose: bytes | None = None
+        self.last_message_monotonic_s: float | None = None
+
+    @classmethod
+    def _command_mode(cls, payload: bytes) -> str | None:
+        prefix = b"command"
+        body = len(prefix) + cls.HEADER_SIZE
+        if not payload.startswith(prefix) or len(payload) < body + 3:
+            return None
+        start, stop, planner = payload[body : body + 3]
+        if stop:
+            return "off"
+        if start:
+            return "planner" if planner else "pose"
+        return None
+
+    def drain(self) -> None:
+        while True:
+            try:
+                payload = self._socket.recv(flags=self._zmq.NOBLOCK)
+            except self._zmq.Again:
+                return
+            self.messages_received += 1
+            self.last_message_monotonic_s = time.monotonic()
+            if payload.startswith(b"command"):
+                mode = self._command_mode(payload)
+                if mode is not None:
+                    self.mode = mode
+                    self.last_command = payload
+            elif payload.startswith(b"planner"):
+                self.last_planner = payload
+            elif payload.startswith(b"pose"):
+                self.last_pose = payload
+
+    def publish(
+        self,
+        planner: NativePlannerClient,
+        *,
+        desktop_active: bool,
+    ) -> bool:
+        """Publish PICO when it owns the frame; return whether it was used."""
+
+        self.drain()
+        if self.mode == "pose":
+            data = self.last_pose
+        elif self.mode == "planner" and not desktop_active:
+            data = self.last_planner
+        else:
+            if desktop_active:
+                self.desktop_override_frames += 1
+            return False
+        if self.last_command is None or data is None:
+            return False
+        planner.send_raw(self.last_command)
+        planner.send_raw(data)
+        self.messages_forwarded += 2
+        return True
+
+    def telemetry(self, *, now_s: float | None = None) -> dict[str, object]:
+        now = time.monotonic() if now_s is None else now_s
+        age = (
+            None
+            if self.last_message_monotonic_s is None
+            else max(0.0, now - self.last_message_monotonic_s)
+        )
+        return {
+            "protocol": "matrix-pico-shared-input/v1",
+            "endpoint": self.endpoint,
+            "mode": self.mode,
+            "messages_received": self.messages_received,
+            "messages_forwarded": self.messages_forwarded,
+            "desktop_override_frames": self.desktop_override_frames,
+            "message_age_s": round(age, 6) if age is not None else None,
+            "planner_ready": self.last_planner is not None,
+            "pose_ready": self.last_pose is not None,
+        }
+
+    def close(self) -> None:
+        self._socket.close(linger=0)
 
 
 class GameInputRuntime:
@@ -4982,6 +5097,7 @@ def main() -> int:
     simulator = create_simulator(config)
     renderer = None
     planner = None
+    pico_router = None
     game_input = None
     game_readiness = None
     game_world = None
@@ -5354,22 +5470,33 @@ def main() -> int:
                         game_command_child_socket = None
                     game_input.bind_expected_peer_pid(provider_pid)
                 if args.pico_gamepad_bridge:
-                    engine_socket = os.environ.get("MATRIX_ENGINE_INPUT_SOCKET")
-                    capability_file = os.environ.get(
-                        "MATRIX_ENGINE_INPUT_CAPABILITY_FILE"
-                    )
-                    if not engine_socket or not capability_file:
+                    private_pico_port = planner_port + 1
+                    if (
+                        private_pico_port > 65535
+                        or private_pico_port == args.pico_manager_command_port
+                    ):
                         raise SystemExit(
-                            "PICO gamepad bridge requires Matrix engine-input socket"
+                            "shared PICO manager has no safe adjacent loopback port"
                         )
-                    processes.start_pico_gamepad(
-                        args.pico_gamepad_python
-                        or args.pico_python
-                        or sys.executable,
-                        engine_socket=Path(engine_socket),
-                        capability_file=Path(capability_file),
-                        status_file=args.pico_gamepad_status_file,
+                    private_pico_endpoint = (
+                        f"tcp://127.0.0.1:{private_pico_port}"
                     )
+                    pico_router = SharedPicoInputRouter(
+                        private_pico_endpoint,
+                        zmq_module=zmq,
+                    )
+                    processes.start_pico(
+                        args.pico_python or sys.executable,
+                        port=private_pico_port,
+                        command_port=args.pico_manager_command_port,
+                    )
+                    if args.pico_autostart_mode != "off":
+                        _send_pico_manager_command(
+                            zmq,
+                            port=args.pico_manager_command_port,
+                            command=args.pico_autostart_mode,
+                        )
+                        poll_failed_child()
         if running and args.control_source == "pico":
             # Start the subscriber first so the manager's one-shot transition
             # command cannot be published before the deploy path is listening.
@@ -5501,9 +5628,35 @@ def main() -> int:
                     # Telemetry must describe the command actually published,
                     # not the pre-readiness candidate returned by the core.
                     game_input.last_command = game_command
-                    planner.send_game_command(game_command)
+                    desktop_active = bool(
+                        runtime_pause_state is not None
+                        and runtime_pause_state.paused
+                    ) or bool(
+                        not game_command.safe_stop
+                        and (
+                            game_command.mode in {"move", "turn"}
+                            or game_command.locomotion_mode
+                            >= SONIC_NATIVE_MANUAL_MODE_MIN
+                        )
+                    )
+                    pico_published = bool(
+                        pico_router is not None
+                        and pico_router.publish(
+                            planner,
+                            desktop_active=desktop_active,
+                        )
+                    )
+                    if not pico_published:
+                        planner.send_game_command(game_command)
                     game_input.record_published_command(game_command)
-                    walking = game_command.mode == "move"
+                    walking = bool(
+                        game_command.mode == "move"
+                        or (
+                            pico_published
+                            and pico_router is not None
+                            and pico_router.mode == "planner"
+                        )
+                    )
                     if game_commands is not None:
                         command_allowed = bool(
                             game_command.safe_stop
@@ -5937,6 +6090,13 @@ def main() -> int:
                     status["root_yaw_relative_rad"] = round(
                         wrap_angle_rad(current_root_yaw - initial_root_yaw_rad), 6
                     )
+                if pico_router is not None:
+                    status["pico_shared_input"] = pico_router.telemetry(now_s=now)
+                    if args.pico_gamepad_status_file is not None:
+                        _atomic_json(
+                            args.pico_gamepad_status_file,
+                            status["pico_shared_input"],
+                        )
                 if game_world is not None:
                     status["game_world_state"] = game_world.telemetry()
                     status["game_auto_respawn"] = bool(args.game_auto_respawn)
@@ -6271,6 +6431,15 @@ def main() -> int:
             final_status["game_world_state"] = game_world.telemetry()
         if game_commands is not None:
             final_status["game_commands"] = game_commands.telemetry()
+        if pico_router is not None:
+            final_status["pico_shared_input"] = pico_router.telemetry(
+                now_s=finished_wall
+            )
+            if args.pico_gamepad_status_file is not None:
+                _atomic_json(
+                    args.pico_gamepad_status_file,
+                    final_status["pico_shared_input"],
+                )
         if moon_dynamic_ground is not None:
             final_status["moon_dynamic_ground"] = moon_dynamic_ground.telemetry()
         _atomic_json(args.status_file, final_status)
@@ -6295,6 +6464,9 @@ def main() -> int:
     finally:
         active_exception = sys.exc_info()[0] is not None
         cleanup_errors = []
+        error = _close_runtime_resource("pico shared router", pico_router)
+        if error is not None:
+            cleanup_errors.append(error)
         error = _close_runtime_resource("planner", planner)
         if error is not None:
             cleanup_errors.append(error)
