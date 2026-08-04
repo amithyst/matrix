@@ -5481,7 +5481,10 @@ def main() -> int:
                         game_command_child_socket = None
                     game_input.bind_expected_peer_pid(provider_pid)
                 if args.pico_gamepad_bridge:
-                    private_pico_port = planner_port + 1
+                    # 5557 is SONIC deploy's fixed g1_debug endpoint and 5559
+                    # is the manager command port.  Keep the private manager
+                    # publisher on the next free slot beyond that reserved set.
+                    private_pico_port = planner_port + 5
                     if (
                         private_pico_port > 65535
                         or private_pico_port == args.pico_manager_command_port
