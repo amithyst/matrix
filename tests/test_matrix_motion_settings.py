@@ -41,7 +41,7 @@ class MotionSettingsValueTest(unittest.TestCase):
         self.assertEqual(settings.max_turn_rate_rad_s, 2.50)
         self.assertEqual(settings.keyboard_turn_rate_rad_s, 1.50)
         self.assertEqual(settings.keyboard_turn_boost_rate_rad_s, 3.00)
-        self.assertAlmostEqual(settings.gait_start_heading_error_rad, math.radians(45.0))
+        self.assertAlmostEqual(settings.gait_start_heading_error_rad, math.radians(10.0))
         self.assertAlmostEqual(settings.gait_stop_heading_error_rad, math.radians(90.0))
         self.assertAlmostEqual(settings.camera_heading_snap_error_rad, math.radians(2.0))
         self.assertEqual(settings.keyboard_look_rate_deg_s, 120.0)
@@ -276,7 +276,7 @@ class MotionSettingsValueTest(unittest.TestCase):
         )
         self.assertAlmostEqual(
             settings.value_for_path(MODULE.GAIT_START_HEADING_ERROR_PATH),
-            math.radians(45.0),
+            math.radians(10.0),
         )
         self.assertAlmostEqual(
             settings.value_for_path(MODULE.GAIT_STOP_HEADING_ERROR_PATH),
@@ -470,7 +470,7 @@ class MotionSettingsStepTest(unittest.TestCase):
             (MODULE.MAX_TURN_RATE_PATH, -1, 2.25),
             (MODULE.KEYBOARD_TURN_RATE_PATH, 1, 1.75),
             (MODULE.KEYBOARD_TURN_BOOST_RATE_PATH, -1, 2.75),
-            (MODULE.GAIT_START_HEADING_ERROR_PATH, 1, round(math.radians(46.0), 10)),
+            (MODULE.GAIT_START_HEADING_ERROR_PATH, 1, round(math.radians(11.0), 10)),
             (MODULE.GAIT_STOP_HEADING_ERROR_PATH, -1, round(math.radians(89.0), 10)),
             (
                 MODULE.CAMERA_HEADING_SNAP_ERROR_PATH,

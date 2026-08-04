@@ -667,9 +667,9 @@ class ControlConfig:
     # Camera-face movement should feel like Pico left-stick + right-stick:
     # ordinary camera-relative W/A/S/D keeps walking while the body yaws toward
     # the requested facing.  The gait thresholds are motion gates, not final
-    # alignment tolerances: medium camera turns such as 15 degrees should keep
-    # moving while yaw catches up, while near-reversals may stop and turn first.
-    gait_start_heading_error_rad: float = math.radians(45.0)
+    # alignment tolerances: small camera turns should keep moving while yaw
+    # catches up, while large turns may stop and turn first.
+    gait_start_heading_error_rad: float = math.radians(10.0)
     gait_stop_heading_error_rad: float = math.radians(90.0)
     # Separate final-facing precision.  Once the rate-limited facing target is
     # within this error of the camera/movement yaw, publish the exact requested

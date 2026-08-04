@@ -1029,6 +1029,7 @@ class GameControlCoreTest(unittest.TestCase):
                 max_acceleration_mps2=1.2,
                 max_deceleration_mps2=2.4,
                 max_turn_rate_rad_s=2.5,
+                gait_start_heading_error_rad=math.radians(45.0),
             )
         )
         core.accept_snapshot(snapshot(pressed=("w",)), received_at_s=10.0)
@@ -1069,7 +1070,7 @@ class GameControlCoreTest(unittest.TestCase):
         self.assertEqual(core.command(now_s=10.0, dt_s=0.1).mode, "move")
 
         # Once active, noise near the 90-degree stop edge stops exactly once;
-        # it cannot restart until alignment crosses the tighter 45-degree edge.
+        # it cannot restart until alignment crosses the tighter 10-degree edge.
         stop_error = math.radians(90.0)
         active_modes = []
         for sequence, delta in enumerate((-0.002, 0.002, -0.002, 0.002), start=2):
@@ -1087,12 +1088,12 @@ class GameControlCoreTest(unittest.TestCase):
             active_modes.append(core.command(now_s=now, dt_s=0.02).mode)
         self.assertEqual(active_modes, ["move", "turn", "turn", "turn"])
 
-        # A request outside the 45-degree start edge remains turn-only.
+        # A request outside the 10-degree start edge remains turn-only.
         # Crossing that edge starts once, and drifting just outside it remains
         # active because the wider 90-degree stop edge has not been crossed.
         sequence = 6
         now = 10.06
-        core.synchronize_heading(math.radians(46.0))
+        core.synchronize_heading(math.radians(11.0))
         core.accept_snapshot(
             snapshot(
                 sequence=sequence,
@@ -1105,7 +1106,7 @@ class GameControlCoreTest(unittest.TestCase):
         self.assertEqual(core.command(now_s=now, dt_s=0.02).mode, "turn")
 
         restart_modes = []
-        for sequence, error_deg in enumerate((46.0, 44.0, 60.0), start=7):
+        for sequence, error_deg in enumerate((11.0, 9.0, 60.0), start=7):
             now = 10.0 + sequence * 0.01
             core.synchronize_heading(math.radians(error_deg))
             core.accept_snapshot(

@@ -885,7 +885,7 @@ class OverlayStateTest(unittest.TestCase):
                 MODULE.GAIT_START_HEADING_ERROR_FIELD,
                 compact=False,
             ),
-            "边走≤45°",
+            "边走≤10°",
         )
         self.assertEqual(
             MODULE.motion_value_label(
@@ -924,7 +924,7 @@ class OverlayStateTest(unittest.TestCase):
         self.assertIn(MODULE.GAIT_START_HEADING_ERROR_PATH, start_command)
         self.assertIn(MODULE.GAIT_STOP_HEADING_ERROR_PATH, stop_command)
         self.assertIn(MODULE.CAMERA_HEADING_SNAP_ERROR_PATH, snap_command)
-        self.assertIn(f"set value {math.radians(46.0):.10f}", start_command)
+        self.assertIn(f"set value {math.radians(11.0):.10f}", start_command)
         self.assertIn(f"set value {math.radians(89.0):.10f}", stop_command)
         self.assertIn(f"set value {math.radians(3.0):.10f}", snap_command)
 

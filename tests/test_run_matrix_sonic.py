@@ -1210,7 +1210,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(status["keyboard_slow_speed_mps"], 0.10)
         self.assertEqual(status["keyboard_walk_speed_mps"], 0.80)
         self.assertEqual(status["keyboard_run_speed_mps"], 2.50)
-        self.assertAlmostEqual(status["gait_start_heading_error_deg"], 45.0)
+        self.assertAlmostEqual(status["gait_start_heading_error_deg"], 10.0)
         self.assertAlmostEqual(status["gait_stop_heading_error_deg"], 90.0)
         self.assertAlmostEqual(status["camera_heading_snap_error_deg"], 2.0)
         self.assertEqual(status["maximum_speed_mps"], 0.30)
