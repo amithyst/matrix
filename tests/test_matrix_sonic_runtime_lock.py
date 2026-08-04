@@ -1829,6 +1829,10 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
                 with self.subTest(overrides=overrides):
                     environment = os.environ.copy()
                     environment.update(overrides)
+                    # The TRNA profile points at a host-local optional overlay.
+                    # Disable it so this test reaches the qualification safety
+                    # gate on hosts that do not carry that external artifact.
+                    environment["MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE"] = ""
                     environment["MATRIX_SONIC_HOST_LOCK"] = str(
                         root / f"{next(iter(overrides))}.lock"
                     )
