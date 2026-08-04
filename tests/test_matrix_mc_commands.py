@@ -166,6 +166,11 @@ class McCommandParserTest(unittest.TestCase):
         )
         self.assertEqual(MODULE.world_scene_target("earth")["scene_id"], 2)
         self.assertEqual(MODULE.world_scene_target("moon")["scene_id"], 15)
+        self.assertEqual(MODULE.world_scene_target("realscan")["scene_id"], 18)
+        self.assertEqual(
+            MODULE.world_scene_target("robot-training-ground")["map_name"],
+            "/Game/Maps/RobotTrainingGround",
+        )
 
         for text in ("/world mars", "/scene 999", "/planet ../../moon"):
             with self.subTest(text=text), self.assertRaises(MODULE.CommandParseError):

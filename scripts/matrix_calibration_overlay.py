@@ -3078,7 +3078,6 @@ def celestial_navigation_model(state: dict[str, object]) -> CelestialNavigationM
     for destination in destinations:
         contract = (
             destination.body_name,
-            destination.runtime_status,
             destination.gravity_m_s2,
             destination.atmosphere,
         )
@@ -3089,7 +3088,10 @@ def celestial_navigation_model(state: dict[str, object]) -> CelestialNavigationM
         if (
             body_model is None
             or body_model.display_name != destination.body_name
-            or body_model.runtime_status != destination.runtime_status
+            or (
+                destination.runtime_status == "active"
+                and body_model.runtime_status != "active"
+            )
         ):
             return fallback
     if (

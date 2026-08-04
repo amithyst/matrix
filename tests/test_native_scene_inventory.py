@@ -37,9 +37,20 @@ class NativeSceneInventoryTest(unittest.TestCase):
         self.assertEqual(scene["launcher_ids"], [14, 16, 17])
 
     def test_every_native_scene_has_a_complete_physics_proxy_count(self) -> None:
-        for scene in self.inventory["selectable_scenes"]:
+        for scene in (
+            self.inventory["selectable_scenes"]
+            + self.inventory.get("external_candidate_scenes", [])
+        ):
             proxy = scene["physics_proxy"]
             self.assertEqual(proxy["geom_count"], sum(proxy["geom_types"].values()))
+
+    def test_realscan_is_tracked_as_external_candidate_not_release_012(self) -> None:
+        candidates = self.inventory["external_candidate_scenes"]
+        self.assertEqual(len(candidates), 1)
+        scene = candidates[0]
+        self.assertEqual(scene["launcher_ids"], [18])
+        self.assertEqual(scene["availability"], "requires_verified_cooked_receipt")
+        self.assertNotIn("release_package", scene)
 
 
 if __name__ == "__main__":

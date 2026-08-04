@@ -3575,7 +3575,7 @@ class GameCommandRuntime:
     @staticmethod
     def _restart_target_from_data(data: Mapping[str, object]) -> dict[str, object] | None:
         scene_id = data.get("target_scene_id")
-        if type(scene_id) is not int or scene_id not in {2, 15}:
+        if type(scene_id) is not int or scene_id not in {2, 15, 18}:
             return None
         target: dict[str, object] = {"scene_id": scene_id}
         for field in (

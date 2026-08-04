@@ -4034,6 +4034,53 @@ def _celestial_project_root(project_root: Path | None) -> Path:
     return Path(os.environ.get("MATRIX_PROJECT_ROOT", Path(__file__).resolve().parents[1]))
 
 
+def _realscan_visual_receipt_available(project_root: Path, receipt_path: Path) -> bool:
+    if not receipt_path.is_file() or receipt_path.is_symlink():
+        return False
+    try:
+        value = json.loads(receipt_path.read_text())
+    except (OSError, UnicodeError, ValueError):
+        return False
+    if (
+        not isinstance(value, dict)
+        or value.get("schema") != "matrix-realscan-ue-package-receipt/v1"
+        or value.get("map_name") != "/Game/Maps/RobotTrainingGround"
+    ):
+        return False
+    files = value.get("files")
+    if not isinstance(files, list) or len(files) != 3:
+        return False
+    suffixes: set[str] = set()
+    stems: set[str] = set()
+    for item in files:
+        if not isinstance(item, dict):
+            return False
+        name = item.get("name")
+        size = item.get("size_bytes")
+        if (
+            not isinstance(name, str)
+            or Path(name).name != name
+            or not name.startswith("pakchunk")
+            or type(size) is not int
+            or size <= 0
+        ):
+            return False
+        package = (
+            project_root
+            / "src/UeSim/Linux/zsibot_mujoco_ue/Content/Paks"
+            / name
+        )
+        if (
+            not package.is_file()
+            or package.is_symlink()
+            or package.stat().st_size != size
+        ):
+            return False
+        suffixes.add(package.suffix)
+        stems.add(name.rsplit(".", 1)[0])
+    return suffixes == {".pak", ".utoc", ".ucas"} and len(stems) == 1
+
+
 def _celestial_scene_assets_available(
     project_root: Path,
     target: Mapping[str, object],
@@ -4050,7 +4097,14 @@ def _celestial_scene_assets_available(
     ]
     if destination_id == "moon":
         required.append(project_root / "dynamicmaps/moonworld.bin")
-    return all(path.is_file() for path in required)
+    if destination_id == "realscan":
+        receipt = target.get("visual_receipt")
+        if not isinstance(receipt, str):
+            return False
+        receipt_path = project_root / receipt
+        if not _realscan_visual_receipt_available(project_root, receipt_path):
+            return False
+    return all(path.is_file() and not path.is_symlink() for path in required)
 
 
 def _celestial_target_vector(
@@ -4071,7 +4125,10 @@ def celestial_navigation_mapping(
 
     root = _celestial_project_root(project_root)
     raw_scene_id = build_info.get("scene_id")
-    current_destination = "moon" if raw_scene_id == 15 else "town10"
+    current_destination = {
+        15: "moon",
+        18: "realscan",
+    }.get(raw_scene_id, "town10")
     ready: dict[str, bool] = {}
     for destination_id, target in WORLD_SCENE_TARGETS.items():
         ready[destination_id] = _celestial_scene_assets_available(root, target)
@@ -4092,7 +4149,7 @@ def celestial_navigation_mapping(
     )
     assert isinstance(current_atmosphere, str)
     destinations: list[dict[str, object]] = []
-    for destination_id in ("town10", "moon"):
+    for destination_id in ("town10", "moon", "realscan"):
         target = WORLD_SCENE_TARGETS[destination_id]
         is_ready = ready.get(destination_id, False)
         destinations.append(

@@ -48,6 +48,8 @@ def validate_inventory(
 ) -> list[str]:
     errors: list[str] = []
     scenes = inventory.get("selectable_scenes", [])
+    external_scenes = inventory.get("external_candidate_scenes", [])
+    launcher_scenes = [*scenes, *external_scenes]
     internal_maps = inventory.get("internal_base_maps", [])
     declared = inventory.get("counts", {})
 
@@ -59,7 +61,9 @@ def validate_inventory(
         "unique_selectable_map_packages": len(
             {scene.get("package_name") for scene in scenes}
         ),
-        "launcher_scene_ids": sum(len(scene.get("launcher_ids", [])) for scene in scenes),
+        "launcher_scene_ids": sum(
+            len(scene.get("launcher_ids", [])) for scene in launcher_scenes
+        ),
         "internal_base_maps": len(internal_maps),
         "total_packaged_map_assets": len(scenes) + len(internal_maps),
     }
@@ -70,13 +74,14 @@ def validate_inventory(
 
     package_files: set[str] = set()
     scene_ids: set[int] = set()
-    for scene in scenes:
+    for scene in launcher_scenes:
         name = scene.get("package_name", "<unnamed>")
-        package = scene.get("release_package", {})
-        package_file = package.get("file")
-        if package_file in package_files:
-            errors.append(f"duplicate release package file: {package_file}")
-        package_files.add(package_file)
+        if scene in scenes:
+            package = scene.get("release_package", {})
+            package_file = package.get("file")
+            if package_file in package_files:
+                errors.append(f"duplicate release package file: {package_file}")
+            package_files.add(package_file)
 
         proxy = scene.get("physics_proxy")
         if not isinstance(proxy, dict):

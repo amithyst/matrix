@@ -3339,6 +3339,45 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 provider_socket.close()
                 runtime.close()
 
+    def test_game_command_runtime_realscan_restart_records_scene_18(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "world-state.json"
+            runtime_socket, provider_socket = socket.socketpair(
+                socket.AF_UNIX,
+                socket.SOCK_SEQPACKET,
+            )
+            provider_socket.settimeout(1.0)
+            world = MODULE._GameWorldStateRuntime(
+                path=state_path,
+                world_id="town10:test",
+                world_revision="a" * 64,
+                checkpoint_seconds=0.75,
+            )
+            runtime = MODULE.GameCommandRuntime(runtime_socket, world)
+            pose = WORLD_STATE.WorldPose(1.0, 2.0, 0.8, 0.25)
+            request = self.game_command_request(
+                "/world realscan",
+                sequence=1,
+                request_character="8",
+            )
+            try:
+                provider_socket.send(MC_COMMANDS.encode_command_request(request))
+                self.assertTrue(runtime.poll(current_pose=pose, command_allowed=True))
+                response = MC_COMMANDS.decode_command_response(
+                    provider_socket.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES)
+                )
+                self.assertTrue(response.ok)
+                self.assertTrue(response.restart_required)
+                self.assertEqual(response.data["target_scene_id"], 18)
+                self.assertEqual(runtime.restart_target["scene_id"], 18)
+                self.assertEqual(
+                    runtime.restart_target["target_map_name"],
+                    "/Game/Maps/RobotTrainingGround",
+                )
+            finally:
+                provider_socket.close()
+                runtime.close()
+
     def test_game_command_runtime_rejects_world_commands_without_world_state(self) -> None:
         runtime_socket, provider_socket = socket.socketpair(
             socket.AF_UNIX,

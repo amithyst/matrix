@@ -821,6 +821,14 @@ case "$SCENE_ID" in
     14) SCENE="3dgs.xml";                 MAPNAME="/Game/Maps/3DGSWorld" ;;
     16) SCENE="3dgs.xml";                 MAPNAME="/Game/Maps/3DGSWorld" ;;
     17) SCENE="3dgs.xml";                 MAPNAME="/Game/Maps/3DGSWorld" ;;
+    18)
+        SCENE="scene_terrain_robot_training_ground.xml"
+        MAPNAME="/Game/Maps/RobotTrainingGround"
+        if ! python3 scripts/verify_realscan_scene_install.py --project-root "$PROJECT_ROOT"; then
+            echo "[ERROR] RobotTrainingGround assets are not installed or verified" >&2
+            exit 1
+        fi
+        ;;
     15)
         SCENE="scene_terrain_moon_dynamic.xml"
         MAPNAME="/Game/Maps/MoonWorld"

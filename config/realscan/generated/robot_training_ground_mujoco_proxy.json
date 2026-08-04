@@ -1,0 +1,39 @@
+{
+  "boundary_box_count": 453,
+  "bounds_xyz": {
+    "maximum": [
+      22.75,
+      37.0,
+      0.25
+    ],
+    "minimum": [
+      -28.25,
+      -14.0,
+      -1.49
+    ]
+  },
+  "grid": {
+    "height": 205,
+    "width": 205
+  },
+  "heightfield": {
+    "filename": "robot_training_ground_lower_floor.png",
+    "sha256": "aa039704c574d8c6e86ab9c40750fd0e497843f03e35b300308b4d7b1f04443f"
+  },
+  "limitations": [
+    "lower floor only",
+    "static navigation collision proxy",
+    "upper floor and movable objects require later explicit bodies"
+  ],
+  "physics_backend": "mujoco",
+  "resolution_m": 0.25,
+  "scene": "robot-training-ground_20260715-142024",
+  "schema": "matrix-realscan-mujoco-proxy/v1",
+  "scope": "lower_floor_navigation_proxy",
+  "source_navmesh_sha256": "bcb26378b769c5256df3246d17317f82f0dea65ced907f76d53943f92b4b75ee",
+  "walkable_cells": 18531,
+  "xml": {
+    "filename": "scene_terrain_robot_training_ground.xml",
+    "sha256": "94da6a5794c9f319486b927fd1a709f8df08f612bae51efc0e376ba2d2d5336a"
+  }
+}

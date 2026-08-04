@@ -487,6 +487,52 @@ class CelestialNavigationMappingTest(unittest.TestCase):
             self.assertTrue(model.destination_enabled("moon"))
             self.assertEqual(moon.body_name, "月球")
             self.assertEqual(moon.local_position_m, (-94.7, -65.6, 0.8))
+            realscan = next(
+                destination
+                for destination in model.destinations
+                if destination.destination_id == "realscan"
+            )
+            self.assertFalse(model.destination_enabled("realscan"))
+            self.assertEqual(realscan.status, "world_unavailable")
+
+            for scene_xml in ("scene_terrain_robot_training_ground.xml",):
+                self.touch(root / "src/robot_mujoco/zsibot_robots/xgb" / scene_xml)
+                self.touch(
+                    root
+                    / "src/UeSim/Linux/zsibot_mujoco_ue/Content/model/xgb"
+                    / scene_xml
+                )
+            paks = root / "src/UeSim/Linux/zsibot_mujoco_ue/Content/Paks"
+            files = []
+            for suffix in (".pak", ".utoc", ".ucas"):
+                package = paks / f"pakchunk88-RobotTrainingGround-Linux{suffix}"
+                self.touch(package)
+                files.append(
+                    {"name": package.name, "size_bytes": package.stat().st_size}
+                )
+            receipt = (
+                root
+                / "src/UeSim/Linux/zsibot_mujoco_ue/Saved/Paks"
+                / "RobotTrainingGroundActive/receipt.json"
+            )
+            receipt.parent.mkdir(parents=True, exist_ok=True)
+            receipt.write_text(
+                json.dumps(
+                    {
+                        "schema": "matrix-realscan-ue-package-receipt/v1",
+                        "map_name": "/Game/Maps/RobotTrainingGround",
+                        "files": files,
+                    }
+                )
+            )
+            refreshed = OVERLAY_MODEL.celestial_navigation_model(
+                {
+                    "celestial_navigation": MODULE.celestial_navigation_mapping(
+                        {"scene_id": 2}, project_root=root
+                    )
+                }
+            )
+            self.assertTrue(refreshed.destination_enabled("realscan"))
 
 
 class MovementModeSyncTest(unittest.TestCase):

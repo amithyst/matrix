@@ -1339,7 +1339,7 @@ if not isinstance(internal, dict):
 target = internal.get("target_scene_id")
 if target is None:
     print("")
-elif type(target) is int and target in {2, 15}:
+elif type(target) is int and target in {2, 15, 18}:
     print(target)
 else:
     raise SystemExit(1)

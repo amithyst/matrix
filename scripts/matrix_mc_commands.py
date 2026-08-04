@@ -105,6 +105,33 @@ WORLD_SCENE_TARGETS: Mapping[str, Mapping[str, object]] = {
         "gravity_m_s2": 1.62,
         "atmosphere": "vacuum",
     },
+    "realscan": {
+        "destination_id": "realscan",
+        "scene_id": 18,
+        "scene_name": "RobotTrainingGround",
+        "scene_xml": "scene_terrain_robot_training_ground.xml",
+        "map_name": "/Game/Maps/RobotTrainingGround",
+        "body_id": "earth",
+        "body_name": "地球",
+        "display_name": "RealScan 机器人训练场",
+        "teleport_tag": "world:realscan",
+        "surface_coordinates_deg_m": [0.0, 0.0, 0.0],
+        "surface_heading_deg": 0.0,
+        "local_position_m": [
+            -12.43780796171463,
+            17.69601835686321,
+            -0.343781353076612,
+        ],
+        "site_universe_position_m": [1000.0, 0.0, 0.0],
+        "universe_position_m": [
+            987.5621920382854,
+            17.69601835686321,
+            -0.343781353076612,
+        ],
+        "gravity_m_s2": 9.80665,
+        "atmosphere": "terrestrial",
+        "visual_receipt": "src/UeSim/Linux/zsibot_mujoco_ue/Saved/Paks/RobotTrainingGroundActive/receipt.json",
+    },
 }
 _WORLD_SCENE_ALIASES = {
     "earth": "town10",
@@ -114,6 +141,11 @@ _WORLD_SCENE_ALIASES = {
     "moon": "moon",
     "moonworld": "moon",
     "luna": "moon",
+    "realscan": "realscan",
+    "robot-training-ground": "realscan",
+    "robot_training_ground": "realscan",
+    "robottrainingground": "realscan",
+    "training": "realscan",
 }
 DEFAULT_RECOVER_ROOT_Z_M = 0.793
 RECOVER_ROOT_LIFT_M = 0.50
