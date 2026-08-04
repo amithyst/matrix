@@ -37,7 +37,18 @@ PLY。导入并烹饪完成后，运行时不再依赖 NuRec。
 
 2. 在 `jszr_mujoco_ue2` 中新建独立的 `RobotTrainingGround` 地图，将上述 PLY
    导入现有 `ThreeDGaussians` 插件。不要覆盖 `/Game/Maps/3DGSWorld`。
-3. 烹饪一个独立的 Pak/UTOC/UCAS trio，并创建 `receipt.json`：
+3. 烹饪一个独立的 Pak/UTOC/UCAS trio，再由工具根据真实文件和 UE Git
+   provenance 自动创建 `receipt.json`：
+
+   ```bash
+   python scripts/create_realscan_scene_receipt.py \
+     --bundle-dir "$ROBOT_TRAINING_GROUND_COOKED_BUNDLE" \
+     --ue-repository "xvirobotics/jszr_mujoco_ue2" \
+     --ue-commit "$(git -C "$JSZR_MUJOCO_UE2" rev-parse HEAD)"
+   ```
+
+   工具要求目录内恰好是一组同 stem 的 `.pak/.utoc/.ucas`，拒绝空文件、
+   symlink、非小写完整 commit 和覆盖既有收据，并计算大小与 SHA256。生成格式为：
 
    ```json
    {
@@ -69,6 +80,22 @@ PLY。导入并烹饪完成后，运行时不再依赖 NuRec。
 `Saved/Paks/RobotTrainingGroundActive/receipt.json`。
 
 ## PICO 启动
+
+不依赖 RealScan 的公共 PICO 入口默认启动 Town10，可先用于遥操链路验收：
+
+```bash
+bash scripts/run_matrix_pico.sh --profile trna
+```
+
+也可以在不启动 Matrix 的情况下检查参数解析与最终命令：
+
+```bash
+bash scripts/run_matrix_pico.sh --profile trna --scene 2 --dry-run
+```
+
+该入口固定 `--control-source pico`，拒绝调用方覆盖，并让 PICO 模式也携带当前
+Matrix branch/commit/dirty 状态的 build provenance。scene 18 会额外执行 RealScan
+安装验证，因此视觉包未就绪时即使 `--dry-run` 也会 fail closed。
 
 场景安装验证通过后，从 tmux 或桌面 launcher 调用：
 

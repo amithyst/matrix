@@ -76,8 +76,79 @@ class RealScanSceneTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         text = launcher.read_text()
         self.assertIn("--scene 18", text)
-        self.assertIn("--control-source pico", text)
-        self.assertIn("verify_realscan_scene_install.py", text)
+        self.assertIn("run_matrix_pico.sh", text)
+
+    def test_receipt_generator_hash_locks_a_cooked_trio(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = Path(temporary) / "bundle"
+            bundle.mkdir()
+            stem = "pakchunk88-RobotTrainingGround-Linux"
+            expected = {}
+            for suffix in (".pak", ".utoc", ".ucas"):
+                package = bundle / f"{stem}{suffix}"
+                package.write_bytes(f"fixture-{suffix}".encode())
+                expected[package.name] = sha256_file(package)
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "scripts/create_realscan_scene_receipt.py"),
+                    "--bundle-dir",
+                    str(bundle),
+                    "--ue-repository",
+                    "xvirobotics/jszr_mujoco_ue2",
+                    "--ue-commit",
+                    "a" * 40,
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            receipt = json.loads((bundle / "receipt.json").read_text())
+            self.assertEqual(receipt, json.loads(completed.stdout))
+            self.assertEqual(receipt["map_name"], "/Game/Maps/RobotTrainingGround")
+            self.assertEqual(
+                {item["name"]: item["sha256"] for item in receipt["files"]},
+                expected,
+            )
+
+    def test_receipt_generator_rejects_symlinked_or_mismatched_packages(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = root / "bundle"
+            bundle.mkdir()
+            stem = "pakchunk88-RobotTrainingGround-Linux"
+            (bundle / f"{stem}.pak").write_bytes(b"pak")
+            (bundle / f"{stem}.utoc").write_bytes(b"utoc")
+            target = root / "outside.ucas"
+            target.write_bytes(b"ucas")
+            (bundle / f"{stem}.ucas").symlink_to(target)
+            command = [
+                sys.executable,
+                str(REPO_ROOT / "scripts/create_realscan_scene_receipt.py"),
+                "--bundle-dir",
+                str(bundle),
+                "--ue-repository",
+                "xvirobotics/jszr_mujoco_ue2",
+                "--ue-commit",
+                "b" * 40,
+            ]
+            completed = subprocess.run(
+                command, capture_output=True, text=True, check=False
+            )
+            self.assertEqual(completed.returncode, 2)
+            self.assertIn("regular non-symlink", completed.stderr)
+            self.assertFalse((bundle / "receipt.json").exists())
+
+            (bundle / f"{stem}.ucas").unlink()
+            (bundle / "pakchunk89-RobotTrainingGround-Linux.ucas").write_bytes(
+                b"ucas"
+            )
+            completed = subprocess.run(
+                command, capture_output=True, text=True, check=False
+            )
+            self.assertEqual(completed.returncode, 2)
+            self.assertIn("matching pak/utoc/ucas trio", completed.stderr)
 
     def test_installer_and_verifier_accept_a_hash_locked_cooked_trio(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

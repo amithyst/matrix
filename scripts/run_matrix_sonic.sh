@@ -601,6 +601,11 @@ if [[ "$CONTROL_SOURCE" == "game" ]]; then
         fi
     done
 fi
+if [[ "$CONTROL_SOURCE" == "pico" \
+    && ! -f "$PROJECT_ROOT/scripts/matrix_build_info.py" ]]; then
+    echo "[ERROR] Matrix PICO provenance dependency is missing: $PROJECT_ROOT/scripts/matrix_build_info.py" >&2
+    exit 1
+fi
 
 require_qualified_path() {
     local label="$1"
@@ -776,7 +781,7 @@ export MATRIX_SONIC_ROOT MATRIX_UNITREE_SDK2_ROOT
 export MATRIX_SONIC_PYTHON MATRIX_PICO_PYTHON
 export MATRIX_SONIC_CANONICAL_MODEL MATRIX_SONIC_CANONICAL_MESHES
 export MATRIX_SONIC_CONTROL_SOURCE="$CONTROL_SOURCE"
-if [[ "$CONTROL_SOURCE" == "game" ]]; then
+if [[ "$CONTROL_SOURCE" == "game" || "$CONTROL_SOURCE" == "pico" ]]; then
     if ! MATRIX_BUILD_INFO_JSON="$(
         /usr/bin/python3 -I "$PROJECT_ROOT/scripts/matrix_build_info.py" \
             --repo-root "$PROJECT_ROOT" \
