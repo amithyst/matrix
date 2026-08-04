@@ -6,6 +6,8 @@ import importlib
 from types import ModuleType
 import sys
 
+import cmeel_pth  # noqa: F401 - activates locked native Pinocchio packages.
+
 
 LEGACY_PACKAGE = "gear_sonic.data.robot_model.instantiation"
 LEGACY_MODULE = f"{LEGACY_PACKAGE}.g1"
