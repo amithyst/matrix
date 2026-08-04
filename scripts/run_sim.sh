@@ -1468,10 +1468,10 @@ if $MATRIX_SONIC_ENABLED; then
     SONIC_DYNAMIC_GROUND_COLLISION_ARGS=()
     set_sonic_spawn_args() {
         SONIC_SPAWN_ARGS=(
-            --spawn-x "$1"
-            --spawn-y "$2"
-            --spawn-z "$3"
-            --spawn-yaw "$4"
+            "--spawn-x=$1"
+            "--spawn-y=$2"
+            "--spawn-z=$3"
+            "--spawn-yaw=$4"
         )
     }
     resolve_moon_spawn_args() {
