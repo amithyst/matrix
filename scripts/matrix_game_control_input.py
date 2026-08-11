@@ -176,6 +176,23 @@ _VIDEO_PANEL_ACTIONS: dict[str, tuple[str, int]] = {
     "video_camera_distance_down": (CAMERA_DISTANCE_CM_FIELD, -1),
     "video_camera_distance_up": (CAMERA_DISTANCE_CM_FIELD, 1),
 }
+_ROBOT_LIGHTING_SCHEMA = "zero-matrix-world-command/v1"
+_ROBOT_LIGHTING_PRESETS: dict[str, tuple[object, ...]] = {
+    "brightness_lumens": (2000, 4000, 6000, 8000, 10000, 14000, 18000, 24000),
+    "contrast": (0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0),
+    "red": (0.0, 0.25, 0.5, 0.75, 1.0),
+    "green": (0.0, 0.25, 0.5, 0.75, 1.0),
+    "blue": (0.0, 0.25, 0.5, 0.75, 1.0),
+    "ambient": (0.0, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0),
+}
+_ROBOT_LIGHTING_DEFAULTS = {
+    "brightness_lumens": 8000,
+    "contrast": 1.0,
+    "red": 1.0,
+    "green": 1.0,
+    "blue": 1.0,
+    "ambient": 2.0,
+}
 _MOVEMENT_MODE_ACTIONS = frozenset(
     f"movement_mode_{movement_mode}"
     for movement_mode in MOVEMENT_MODES
@@ -706,6 +723,71 @@ def video_settings_live_mapping(
         }
     )
     return mapping
+
+
+class RobotLightingController:
+    """Send live robot fill-light tuning commands to the ZeroMatrix UE runtime."""
+
+    def __init__(self, *, host: str, port: int) -> None:
+        self.address = (host, int(port))
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.values = dict(_ROBOT_LIGHTING_DEFAULTS)
+        self.revision = 0
+        self.error: str | None = None
+
+    @staticmethod
+    def _canonical_value(field: object, value: object) -> object:
+        if not isinstance(field, str) or field not in _ROBOT_LIGHTING_PRESETS:
+            raise ValueError("unsupported robot lighting field")
+        presets = _ROBOT_LIGHTING_PRESETS[field]
+        if value not in presets or type(value) is not type(presets[0]):
+            raise ValueError("unsupported robot lighting value")
+        return value
+
+    def live_mapping(self) -> dict[str, object]:
+        return {
+            "available": True,
+            "revision": self.revision,
+            "values": dict(self.values),
+            "error": self.error,
+        }
+
+    def apply_intent(
+        self,
+        field: str,
+        value: object,
+        *,
+        expected_revision: int,
+        active: bool,
+    ) -> bool:
+        if not active:
+            return False
+        if type(expected_revision) is not int or expected_revision != self.revision:
+            return False
+        canonical = self._canonical_value(field, value)
+        if self.values.get(field) == canonical:
+            return False
+        candidate = dict(self.values)
+        candidate[field] = canonical
+        payload = {
+            "schema": _ROBOT_LIGHTING_SCHEMA,
+            "command": "robot_fill_light",
+            "request_id": f"matrix-robot-light-{self.revision + 1}",
+            **candidate,
+        }
+        try:
+            encoded = json.dumps(payload, separators=(",", ":")).encode("ascii")
+            self._socket.sendto(encoded, self.address)
+        except OSError as exc:
+            self.error = str(exc)
+            return True
+        self.values = candidate
+        self.revision += 1
+        self.error = None
+        return True
+
+    def close(self) -> None:
+        self._socket.close()
 
 
 def first_settings_error(*values: str | None) -> str | None:
@@ -3970,6 +4052,9 @@ class OverlayIntent:
     font_size: int | None = None
     pause_target: str | None = None
     expected_epoch: int | None = None
+    robot_light_field: str | None = None
+    robot_light_value: object | None = None
+    expected_revision: int | None = None
 
 
 def function_library_mapping(
@@ -5222,6 +5307,38 @@ class CalibrationOverlaySupervisor:
                     pause_target=pause_target,
                     expected_epoch=expected_epoch,
                 )
+            elif kind == "robot_lighting":
+                expected_revision = value.get("expected_revision")
+                if (
+                    set(value)
+                    != {
+                        "version",
+                        "session",
+                        "sequence",
+                        "kind",
+                        "field",
+                        "value",
+                        "expected_revision",
+                    }
+                    or type(expected_revision) is not int
+                    or not 0 <= expected_revision < 2**63
+                ):
+                    raise RuntimeError("invalid robot-lighting intent revision")
+                field = value.get("field")
+                presets = _ROBOT_LIGHTING_PRESETS.get(field)
+                robot_value = value.get("value")
+                if (
+                    presets is None
+                    or robot_value not in presets
+                    or type(robot_value) is not type(presets[0])
+                ):
+                    raise RuntimeError("invalid robot-lighting intent value")
+                intent = OverlayIntent(
+                    kind="robot_lighting",
+                    robot_light_field=field,
+                    robot_light_value=robot_value,
+                    expected_revision=expected_revision,
+                )
             else:
                 raise RuntimeError("invalid calibration overlay intent kind")
             self._last_action_sequence = sequence
@@ -5398,6 +5515,8 @@ def _parse_args() -> argparse.Namespace:
         "--applied-video-settings-json",
         help="Launcher-applied video settings JSON for pending-restart display",
     )
+    parser.add_argument("--world-command-host", default="127.0.0.1")
+    parser.add_argument("--world-command-port", type=int, default=10001)
     parser.add_argument(
         "--applied-mouse-profile",
         choices=(PROFILE_LOCAL, PROFILE_REMOTE),
@@ -5478,6 +5597,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--max-seconds must be finite and non-negative")
     if not 1 <= args.carla_port <= 65535:
         raise SystemExit("--carla-port must be in [1, 65535]")
+    if not 1 <= args.world_command_port <= 65535:
+        raise SystemExit("--world-command-port must be in [1, 65535]")
     if args.expected_ue_pid is not None and args.expected_ue_pid <= 1:
         raise SystemExit("--expected-ue-pid must be greater than 1")
     if args.expected_ue_pid is None and not args.dry_run:
@@ -5734,6 +5855,10 @@ def main() -> int:
         raise SystemExit(
             f"Matrix game-control input cannot initialize command channel: {exc}"
         ) from exc
+    robot_lighting = RobotLightingController(
+        host=args.world_command_host,
+        port=args.world_command_port,
+    )
     keyboard_camera_integrator = KeyboardCameraLookIntegrator()
     engine_camera_worker: EngineCameraLookWorker | None = None
     if args.engine_input_socket is not None:
@@ -5864,6 +5989,7 @@ def main() -> int:
                             change_count=video_settings_change_count,
                             persistence_error=video_settings_error,
                         ),
+                        "robot_lighting": robot_lighting.live_mapping(),
                         "restart": restart_requester.mapping(),
                         "apply_return": apply_return.mapping(),
                         "command_console": game_command_client.mapping(),
@@ -5988,6 +6114,7 @@ def main() -> int:
             )
             panel_actions: list[str] = []
             panel_font_sizes: list[int] = []
+            robot_lighting_changed = False
             for intent in panel_intents:
                 if intent.kind == "action":
                     assert intent.action is not None
@@ -6022,6 +6149,26 @@ def main() -> int:
                     if intent.active:
                         apply_return.cancel_pending()
                     continue
+                if intent.kind == "robot_lighting":
+                    assert intent.robot_light_field is not None
+                    assert intent.expected_revision is not None
+                    robot_lighting_changed = bool(
+                        robot_lighting.apply_intent(
+                            intent.robot_light_field,
+                            intent.robot_light_value,
+                            expected_revision=intent.expected_revision,
+                            active=(
+                                calibration.active
+                                and raw_keyboard.focused
+                                and not restart_requester.requested
+                                and not game_command_client.in_flight
+                                and not game_command_client.restart_required
+                                and not game_command_client.outcome_unknown
+                            ),
+                        )
+                        or robot_lighting_changed
+                    )
+                    continue
                 assert intent.kind in {"command_submit", "command_quick_submit"}
                 assert intent.command is not None
                 command_submitted = game_command_client.submit(
@@ -6052,6 +6199,7 @@ def main() -> int:
                         "command_submit",
                         "command_quick_submit",
                         "runtime_pause",
+                        "robot_lighting",
                     }
                     for intent in panel_intents
                 )
@@ -6352,6 +6500,7 @@ def main() -> int:
                         or ui_settings_changed
                         or motion_settings_changed
                         or video_settings_changed
+                        or robot_lighting_changed
                         or function_library_changed
                         or restart_requested
                         or teleport_rejections != last_teleport_rejections
@@ -6384,6 +6533,7 @@ def main() -> int:
                                     change_count=video_settings_change_count,
                                     persistence_error=video_settings_error,
                                 ),
+                                "robot_lighting": robot_lighting.live_mapping(),
                                 "restart": restart_requester.mapping(),
                                 "apply_return": apply_return.mapping(),
                                 "command_console": game_command_client.mapping(),
@@ -6490,6 +6640,7 @@ def main() -> int:
                     file=sys.stderr,
                     flush=True,
                 )
+        robot_lighting.close()
         _atomic_json(
             args.status_file,
             {
@@ -6515,6 +6666,7 @@ def main() -> int:
                     change_count=video_settings_change_count,
                     persistence_error=video_settings_error,
                 ),
+                "robot_lighting": robot_lighting.live_mapping(),
                 "mirror_sensitivity": sensitivity_telemetry,
                 "camera_yaw": camera_yaw_telemetry(
                     args.camera_yaw_source,

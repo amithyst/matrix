@@ -1059,6 +1059,62 @@ class PointerActionPublisherTest(unittest.TestCase):
             publisher.close()
             receiver.close()
 
+    def test_robot_lighting_model_and_intent_are_live_video_page_controls(self) -> None:
+        model = MODULE.robot_lighting_panel_model(
+            {
+                "robot_lighting": {
+                    "available": True,
+                    "revision": 7,
+                    "values": {
+                        "brightness_lumens": 8000,
+                        "contrast": 1.0,
+                        "red": 1.0,
+                        "green": 1.0,
+                        "blue": 1.0,
+                        "ambient": 2.0,
+                    },
+                    "error": None,
+                }
+            }
+        )
+        self.assertTrue(model.available)
+        self.assertEqual(model.stepped_value("robot_light_contrast_up"), 1.25)
+        layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 720))
+        self.assertIn("robot_light_contrast_up", layout)
+
+        receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        publisher = MODULE.PointerActionPublisher(
+            file_descriptor=sender.detach(),
+            session="known-session",
+        )
+        try:
+            publisher.publish_robot_lighting_setting(
+                "contrast",
+                1.25,
+                expected_revision=model.revision,
+            )
+            self.assertEqual(
+                json.loads(receiver.recv(1024).decode("ascii")),
+                {
+                    "version": 1,
+                    "session": "known-session",
+                    "sequence": 1,
+                    "kind": "robot_lighting",
+                    "field": "contrast",
+                    "value": 1.25,
+                    "expected_revision": 7,
+                },
+            )
+            with self.assertRaisesRegex(ValueError, "invalid"):
+                publisher.publish_robot_lighting_setting(
+                    "contrast",
+                    "1.25;quit",
+                    expected_revision=7,
+                )
+        finally:
+            publisher.close()
+            receiver.close()
+
     def test_command_intents_have_disjoint_strict_shapes(self) -> None:
         receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         publisher = MODULE.PointerActionPublisher(

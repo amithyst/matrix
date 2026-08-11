@@ -267,6 +267,84 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
                 receiver.close()
                 supervisor._action_socket = None
 
+    def test_robot_lighting_intent_is_strict_and_sends_live_udp_command(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            script = root / "matrix_calibration_overlay.py"
+            script.write_text("", encoding="utf-8")
+            supervisor = MODULE.CalibrationOverlaySupervisor(
+                state_file=root / "state.json",
+                display_name=None,
+                expected_ue_pid=41,
+                script=script,
+            )
+            receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            receiver.setblocking(False)
+            supervisor._action_socket = receiver
+            udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            udp.bind(("127.0.0.1", 0))
+            udp.settimeout(1.0)
+            controller = MODULE.RobotLightingController(
+                host="127.0.0.1",
+                port=udp.getsockname()[1],
+            )
+            packet = {
+                "version": 1,
+                "session": supervisor._action_session,
+                "sequence": 1,
+                "kind": "robot_lighting",
+                "field": "contrast",
+                "value": 1.25,
+                "expected_revision": 0,
+            }
+            try:
+                sender.send(json.dumps(packet).encode("ascii"))
+                intents = supervisor.drain_intents()
+                self.assertEqual(
+                    intents,
+                    (
+                        MODULE.OverlayIntent(
+                            kind="robot_lighting",
+                            robot_light_field="contrast",
+                            robot_light_value=1.25,
+                            expected_revision=0,
+                        ),
+                    ),
+                )
+                intent = intents[0]
+                self.assertTrue(
+                    controller.apply_intent(
+                        intent.robot_light_field,
+                        intent.robot_light_value,
+                        expected_revision=intent.expected_revision,
+                        active=True,
+                    )
+                )
+                payload = json.loads(udp.recv(4096).decode("ascii"))
+                self.assertEqual(
+                    payload["schema"],
+                    "zero-matrix-world-command/v1",
+                )
+                self.assertEqual(payload["command"], "robot_fill_light")
+                self.assertEqual(payload["contrast"], 1.25)
+                self.assertEqual(payload["brightness_lumens"], 8000)
+                self.assertEqual(controller.live_mapping()["revision"], 1)
+                self.assertFalse(
+                    controller.apply_intent(
+                        "red",
+                        0.75,
+                        expected_revision=0,
+                        active=True,
+                    )
+                )
+                self.assertEqual(controller.live_mapping()["values"]["red"], 1.0)
+            finally:
+                controller.close()
+                udp.close()
+                sender.close()
+                receiver.close()
+                supervisor._action_socket = None
+
     def test_private_action_socket_rejects_wrong_session_and_direct_restart(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

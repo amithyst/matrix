@@ -1131,7 +1131,12 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
     video_top = tab_y + tab_height + gap
     video_bottom = apply_y - gap
     video_row_gap = 4 if compact else 8
-    video_rows = max(1, len(_VIDEO_SETTING_PRESETS) + 3)
+    video_rows = max(
+        1,
+        len(_VIDEO_SETTING_PRESETS)
+        + len(_VIDEO_CAMERA_DISTANCE_FIELDS)
+        + len(_ROBOT_LIGHTING_PRESETS),
+    )
     video_row_height = max(
         24,
         (video_bottom - video_top - (video_rows - 1) * video_row_gap) // video_rows,
@@ -1185,6 +1190,30 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
     result["video_camera_distance_cm_slider"] = result[
         "video_camera_distance_cm_value"
     ]
+    robot_start = len(_VIDEO_SETTING_PRESETS) + len(_VIDEO_CAMERA_DISTANCE_FIELDS)
+    for index, field in enumerate(_ROBOT_LIGHTING_PRESETS):
+        row_y = video_top + (robot_start + index) * (
+            video_row_height + video_row_gap
+        )
+        stem = f"robot_light_{field}"
+        result[f"{stem}_down"] = (
+            panel_x + margin,
+            row_y,
+            video_button_width,
+            video_row_height,
+        )
+        result[f"{stem}_value"] = (
+            panel_x + margin + video_button_width,
+            row_y,
+            max(1, panel_width - 2 * margin - 2 * video_button_width),
+            video_row_height,
+        )
+        result[f"{stem}_up"] = (
+            panel_x + panel_width - margin - video_button_width,
+            row_y,
+            video_button_width,
+            video_row_height,
+        )
     return result
 
 
@@ -1427,6 +1456,28 @@ _VIDEO_VALUE_HOVER_TARGETS = tuple(
     f"video_{field}_value"
     for field in tuple(_VIDEO_SETTING_PRESETS) + _VIDEO_CAMERA_DISTANCE_FIELDS
 )
+_ROBOT_LIGHTING_PRESETS: dict[str, tuple[object, ...]] = {
+    "brightness_lumens": (2000, 4000, 6000, 8000, 10000, 14000, 18000, 24000),
+    "contrast": (0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0),
+    "red": (0.0, 0.25, 0.5, 0.75, 1.0),
+    "green": (0.0, 0.25, 0.5, 0.75, 1.0),
+    "blue": (0.0, 0.25, 0.5, 0.75, 1.0),
+    "ambient": (0.0, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0),
+}
+_ROBOT_LIGHTING_LABELS = {
+    "brightness_lumens": "Robot Light Brightness",
+    "contrast": "Robot Contrast",
+    "red": "Robot Light Red",
+    "green": "Robot Light Green",
+    "blue": "Robot Light Blue",
+    "ambient": "Shadow Fill",
+}
+_ROBOT_LIGHTING_STEP_ACTION_DETAILS = {
+    f"robot_light_{field}_{suffix}": (field, direction)
+    for field in _ROBOT_LIGHTING_PRESETS
+    for suffix, direction in (("down", -1), ("up", 1))
+}
+_ROBOT_LIGHTING_STEP_ACTIONS = tuple(_ROBOT_LIGHTING_STEP_ACTION_DETAILS)
 
 _PANEL_DIRECTORY_PAGE = "directory"
 _BACK_TO_DIRECTORY_ACTION = "back_to_directory"
@@ -1574,6 +1625,7 @@ _PANEL_HIT_TARGETS = (
     + _FUNCTION_PRESET_HIT_TARGETS
     + _NATIVE_MODE_HIT_TARGETS
     + _VIDEO_STEP_ACTIONS
+    + _ROBOT_LIGHTING_STEP_ACTIONS
     + _VIDEO_CAMERA_DISTANCE_BOUND_INPUT_ACTIONS
 )
 
@@ -1668,6 +1720,7 @@ def _targets_for_panel_page(
             (_BACK_TO_DIRECTORY_ACTION, "runtime_pause", "quit_game", "apply_return")
             + ("video_camera_distance_cm_slider",)
             + _VIDEO_STEP_ACTIONS
+            + _ROBOT_LIGHTING_STEP_ACTIONS
             + _VIDEO_CAMERA_DISTANCE_BOUND_INPUT_ACTIONS
         )
         if include_hover_only:
@@ -3482,6 +3535,75 @@ def video_settings_panel_model(state: dict[str, object]) -> VideoSettingsPanelMo
     )
 
 
+@dataclass(frozen=True)
+class RobotLightingPanelModel:
+    """Strict render-only view of live UE robot fill-light controls."""
+
+    available: bool
+    revision: int
+    values: tuple[tuple[str, object], ...]
+    error: str | None
+
+    def value(self, field: str) -> object:
+        return dict(self.values)[field]
+
+    def stepped_value(self, action: str) -> object | None:
+        detail = _ROBOT_LIGHTING_STEP_ACTION_DETAILS.get(action)
+        if detail is None or not self.available or self.error is not None:
+            return None
+        field, direction = detail
+        presets = _ROBOT_LIGHTING_PRESETS[field]
+        current = self.value(field)
+        try:
+            index = presets.index(current)
+        except ValueError:
+            return None
+        target = index + direction
+        return presets[target] if 0 <= target < len(presets) else None
+
+
+def _canonical_robot_lighting_mapping(value: object) -> dict[str, object] | None:
+    if not isinstance(value, dict):
+        return None
+    result: dict[str, object] = {}
+    for field, presets in _ROBOT_LIGHTING_PRESETS.items():
+        candidate = value.get(field)
+        if candidate in presets and type(candidate) is type(presets[0]):
+            result[field] = candidate
+            continue
+        return None
+    return result
+
+
+def robot_lighting_panel_model(state: dict[str, object]) -> RobotLightingPanelModel:
+    raw = state.get("robot_lighting")
+    raw = raw if isinstance(raw, dict) else {}
+    values = _canonical_robot_lighting_mapping(raw.get("values"))
+    revision = raw.get("revision")
+    error_value = raw.get("error")
+    error = (
+        _bounded_status_text(error_value, maximum=256)
+        if isinstance(error_value, str)
+        else None
+    )
+    available = bool(
+        raw.get("available") is True
+        and values is not None
+        and type(revision) is int
+        and 0 <= revision < 2**63
+    )
+    if values is None:
+        values = {
+            field: presets[0] for field, presets in _ROBOT_LIGHTING_PRESETS.items()
+        }
+    return RobotLightingPanelModel(
+        available=available,
+        revision=revision if type(revision) is int and revision >= 0 else 0,
+        values=tuple(values.items()),
+        error=error,
+    )
+
+
 def _motion_settings_candidate(state: dict[str, object]) -> object:
     direct = state.get("motion_settings")
     if direct is not None:
@@ -4677,6 +4799,31 @@ class PointerActionPublisher:
             },
         )
 
+    def publish_robot_lighting_setting(
+        self,
+        field: str,
+        value: object,
+        *,
+        expected_revision: int,
+    ) -> None:
+        presets = _ROBOT_LIGHTING_PRESETS.get(field)
+        if (
+            presets is None
+            or value not in presets
+            or type(value) is not type(presets[0])
+            or type(expected_revision) is not int
+            or not 0 <= expected_revision < 2**63
+        ):
+            raise ValueError("robot lighting intent is invalid")
+        self._publish(
+            "robot_lighting",
+            {
+                "field": field,
+                "value": value,
+                "expected_revision": expected_revision,
+            },
+        )
+
     def publish_runtime_pause(self, target: str, *, expected_epoch: int) -> None:
         if (
             type(target) is not str
@@ -4860,6 +5007,7 @@ class X11CalibrationOverlay:
         self._last_inventory_model: CreativeInventoryModel | None = None
         self._last_navigation_model: CelestialNavigationModel | None = None
         self._last_video_model: VideoSettingsPanelModel | None = None
+        self._last_robot_lighting_model: RobotLightingPanelModel | None = None
         self._last_function_model: FunctionLibraryModel | None = None
         self._last_build_info_model: BuildInfoPanelModel | None = None
         self._last_startup_loading_model = startup_loading_model({})
@@ -7945,6 +8093,7 @@ class X11CalibrationOverlay:
         self,
         layout: dict[str, tuple[int, int, int, int]],
         model: VideoSettingsPanelModel,
+        robot_lighting: RobotLightingPanelModel,
     ) -> None:
         bound_editor = getattr(self, "_video_distance_bound_editor", None)
         for field, presets in _VIDEO_SETTING_PRESETS.items():
@@ -8007,7 +8156,50 @@ class X11CalibrationOverlay:
                 centred_in=self._panel_rectangle(layout, f"{stem}_value"),
             )
         self._draw_camera_distance_slider(layout, model)
+        for field, presets in _ROBOT_LIGHTING_PRESETS.items():
+            stem = f"robot_light_{field}"
+            current = robot_lighting.value(field)
+            try:
+                index = presets.index(current)
+            except ValueError:
+                index = -1
+            for suffix, allowed in (
+                ("down", index > 0),
+                ("up", 0 <= index < len(presets) - 1),
+            ):
+                enabled = bool(
+                    robot_lighting.available
+                    and robot_lighting.error is None
+                    and allowed
+                )
+                self._draw_button(
+                    layout,
+                    f"{stem}_{suffix}",
+                    "‹" if suffix == "down" else "›",
+                    fill=self._colours["button" if enabled else "disabled"],
+                    disabled=not enabled,
+                )
+            if field == "brightness_lumens":
+                label_value = f"{current} lm"
+            elif isinstance(current, float):
+                label_value = f"{current:.2f}"
+            else:
+                label_value = str(current)
+            self._draw_text(
+                f"{_ROBOT_LIGHTING_LABELS[field]}  ·  {label_value}",
+                x=0,
+                y=0,
+                colour=self._colours[
+                    "white" if robot_lighting.available else "muted"
+                ],
+                centred_in=self._panel_rectangle(layout, f"{stem}_value"),
+            )
         first_row = self._panel_rectangle(layout, "video_resolution_value")
+        robot_status = (
+            f" | Robot Light error: {robot_lighting.error}"
+            if robot_lighting.error is not None
+            else (" | Robot Light live" if robot_lighting.available else "")
+        )
         status = (
             f"保存失败：{model.error}"
             if model.error is not None
@@ -8018,7 +8210,7 @@ class X11CalibrationOverlay:
             )
         )
         self._draw_text(
-            status,
+            f"{status}{robot_status}",
             x=first_row[0],
             y=max(18, first_row[1] - 8),
             colour=self._colours[
@@ -8838,6 +9030,7 @@ class X11CalibrationOverlay:
         inventory_model: CreativeInventoryModel | None = None,
         navigation_model: CelestialNavigationModel | None = None,
         video_model: VideoSettingsPanelModel | None = None,
+        robot_lighting_model: RobotLightingPanelModel | None = None,
         function_model: FunctionLibraryModel | None = None,
         runtime_pause_model: RuntimePausePanelModel | None = None,
         build_info_model: BuildInfoPanelModel | None = None,
@@ -8928,6 +9121,7 @@ class X11CalibrationOverlay:
             self._draw_video_page(
                 layout,
                 video_model or video_settings_panel_model({}),
+                robot_lighting_model or robot_lighting_panel_model({}),
             )
         elif page == "system":
             self._draw_system_page(
@@ -9695,6 +9889,34 @@ class X11CalibrationOverlay:
                             expected_revision=video_model.revision,
                         )
                         emitted += 1
+                elif action in _ROBOT_LIGHTING_STEP_ACTIONS:
+                    robot_lighting = getattr(self, "_last_robot_lighting_model", None)
+                    panel_model = self._last_panel_model
+                    target_value = (
+                        robot_lighting.stepped_value(action)
+                        if robot_lighting is not None
+                        else None
+                    )
+                    if (
+                        target_value is not None
+                        and panel_model is not None
+                        and not panel_model.restart_requested
+                        and panel_model.status != "restarting"
+                        and not self._command_editor.editing
+                        and not self._command_editor.pending
+                        and not self._last_command_status.in_flight
+                        and not self._last_command_status.restart_required
+                        and not self._last_command_status.outcome_unknown
+                        and self._last_command_status.status
+                        not in {"pending", "restarting"}
+                    ):
+                        field, _direction = _ROBOT_LIGHTING_STEP_ACTION_DETAILS[action]
+                        publisher.publish_robot_lighting_setting(
+                            field,
+                            target_value,
+                            expected_revision=robot_lighting.revision,
+                        )
+                        emitted += 1
                 elif action in _MOTION_STEP_ACTIONS:
                     motion_model = getattr(self, "_last_motion_model", None)
                     panel_model = self._last_panel_model
@@ -9762,6 +9984,7 @@ class X11CalibrationOverlay:
         inventory_model = creative_inventory_model(state)
         navigation_model = celestial_navigation_model(state)
         video_model = video_settings_panel_model(state)
+        robot_lighting_model = robot_lighting_panel_model(state)
         function_model = function_library_model(state)
         selected_function = getattr(self, "_selected_function_name", None)
         if selected_function is not None and selected_function not in function_model.files:
@@ -9784,6 +10007,8 @@ class X11CalibrationOverlay:
             or inventory_model != getattr(self, "_last_inventory_model", None)
             or navigation_model != getattr(self, "_last_navigation_model", None)
             or video_model != getattr(self, "_last_video_model", None)
+            or robot_lighting_model
+            != getattr(self, "_last_robot_lighting_model", None)
             or function_model != getattr(self, "_last_function_model", None)
             or build_info_model != getattr(self, "_last_build_info_model", None)
             or startup_model
@@ -9857,6 +10082,7 @@ class X11CalibrationOverlay:
                 inventory_model,
                 navigation_model,
                 video_model,
+                robot_lighting_model,
                 function_model,
                 runtime_pause_model,
                 build_info_model,
@@ -9938,6 +10164,7 @@ class X11CalibrationOverlay:
         self._last_inventory_model = inventory_model
         self._last_navigation_model = navigation_model
         self._last_video_model = video_model
+        self._last_robot_lighting_model = robot_lighting_model
         self._last_function_model = function_model
         self._last_build_info_model = build_info_model
         self._last_startup_loading_model = startup_model
@@ -9986,6 +10213,7 @@ class X11CalibrationOverlay:
         self._last_inventory_model = None
         self._last_navigation_model = None
         self._last_video_model = None
+        self._last_robot_lighting_model = None
         self._last_function_model = None
         self._last_build_info_model = None
         self._last_startup_loading_model = startup_loading_model({})
