@@ -390,6 +390,7 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
                     "zero-matrix-world-command/v1",
                 )
                 self.assertEqual(payload["command"], "robot_fill_light")
+                self.assertIs(payload["enabled"], True)
                 self.assertEqual(payload["contrast"], 1.25)
                 self.assertEqual(payload["brightness_lumens"], 8000)
                 self.assertEqual(controller.live_mapping()["revision"], 1)
@@ -408,6 +409,171 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
                 sender.close()
                 receiver.close()
                 supervisor._action_socket = None
+
+    def test_robot_lighting_enabled_intent_can_disable_extra_fill_light(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            script = root / "matrix_calibration_overlay.py"
+            script.write_text("", encoding="utf-8")
+            supervisor = MODULE.CalibrationOverlaySupervisor(
+                state_file=root / "state.json",
+                display_name=None,
+                expected_ue_pid=41,
+                script=script,
+            )
+            receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            receiver.setblocking(False)
+            supervisor._action_socket = receiver
+            udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            udp.bind(("127.0.0.1", 0))
+            udp.settimeout(1.0)
+            controller = MODULE.RobotLightingController(
+                host="127.0.0.1",
+                port=udp.getsockname()[1],
+            )
+            packet = {
+                "version": 1,
+                "session": supervisor._action_session,
+                "sequence": 1,
+                "kind": "robot_lighting",
+                "field": "enabled",
+                "value": False,
+                "expected_revision": 0,
+            }
+            try:
+                sender.send(json.dumps(packet).encode("ascii"))
+                intents = supervisor.drain_intents()
+                self.assertEqual(
+                    intents,
+                    (
+                        MODULE.OverlayIntent(
+                            kind="robot_lighting",
+                            robot_light_field="enabled",
+                            robot_light_value=False,
+                            expected_revision=0,
+                        ),
+                    ),
+                )
+                intent = intents[0]
+                self.assertTrue(
+                    controller.apply_intent(
+                        intent.robot_light_field,
+                        intent.robot_light_value,
+                        expected_revision=intent.expected_revision,
+                        active=True,
+                    )
+                )
+                payload = json.loads(udp.recv(4096).decode("ascii"))
+                self.assertEqual(payload["command"], "robot_fill_light")
+                self.assertIs(payload["enabled"], False)
+                self.assertEqual(payload["brightness_lumens"], 8000)
+                self.assertIs(
+                    controller.live_mapping()["values"]["enabled"],
+                    False,
+                )
+            finally:
+                controller.close()
+                udp.close()
+                sender.close()
+                receiver.close()
+                supervisor._action_socket = None
+
+    def test_robot_lighting_settings_are_persisted_per_world(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            settings_file = root / "robot-lighting-settings.json"
+            world_status_file = root / "world-status.json"
+            world_status_file.write_text(
+                json.dumps(
+                    {
+                        "schema": "zero-matrix-operator-world-status/v1",
+                        "active_world": "town10",
+                        "available_worlds": ["town10", "realscan-full"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            udp.bind(("127.0.0.1", 0))
+            udp.settimeout(1.0)
+            controller = MODULE.RobotLightingController(
+                host="127.0.0.1",
+                port=udp.getsockname()[1],
+                settings_path=settings_file,
+                world_status_path=world_status_file,
+                initial_world="realscan-full",
+            )
+            try:
+                self.assertTrue(controller.refresh_world())
+                self.assertEqual(controller.active_world, "town10")
+                self.assertIs(controller.live_mapping()["values"]["enabled"], False)
+                payload = json.loads(udp.recv(4096).decode("ascii"))
+                self.assertIs(payload["enabled"], False)
+                self.assertTrue(
+                    controller.apply_intent(
+                        "enabled",
+                        True,
+                        expected_revision=controller.live_mapping()["revision"],
+                        active=True,
+                    )
+                )
+                payload = json.loads(udp.recv(4096).decode("ascii"))
+                self.assertIs(payload["enabled"], True)
+                saved = json.loads(settings_file.read_text(encoding="utf-8"))
+                self.assertIs(saved["worlds"]["town10"]["enabled"], True)
+
+                world_status_file.write_text(
+                    json.dumps(
+                        {
+                            "schema": "zero-matrix-operator-world-status/v1",
+                            "active_world": "realscan-full",
+                            "available_worlds": ["town10", "realscan-full"],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                self.assertTrue(controller.refresh_world())
+                payload = json.loads(udp.recv(4096).decode("ascii"))
+                self.assertEqual(controller.active_world, "realscan-full")
+                self.assertIs(payload["enabled"], True)
+                self.assertIs(controller.live_mapping()["values"]["enabled"], True)
+            finally:
+                controller.close()
+                udp.close()
+
+    def test_robot_lighting_partial_world_settings_keep_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            settings_file = root / "robot-lighting-settings.json"
+            settings_file.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "worlds": {
+                            "town10": {
+                                "enabled": True,
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            udp.bind(("127.0.0.1", 0))
+            controller = MODULE.RobotLightingController(
+                host="127.0.0.1",
+                port=udp.getsockname()[1],
+                settings_path=settings_file,
+                initial_world="town10",
+            )
+            try:
+                values = controller.live_mapping()["values"]
+                self.assertIs(values["enabled"], True)
+                self.assertEqual(values["brightness_lumens"], 8000)
+                self.assertEqual(values["contrast"], 1.0)
+            finally:
+                controller.close()
+                udp.close()
 
     def test_private_action_socket_rejects_wrong_session_and_direct_restart(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

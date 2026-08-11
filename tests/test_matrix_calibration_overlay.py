@@ -703,6 +703,30 @@ class OverlayStateTest(unittest.TestCase):
         )
         self.assertFalse(low.action_enabled("terminal_opacity_down"))
 
+    def test_robot_lighting_model_surfaces_original_lighting_toggle(self) -> None:
+        model = MODULE.robot_lighting_panel_model(
+            {
+                "robot_lighting": {
+                    "available": True,
+                    "revision": 3,
+                    "values": {
+                        "enabled": False,
+                        "brightness_lumens": 8000,
+                        "contrast": 1.0,
+                        "red": 1.0,
+                        "green": 1.0,
+                        "blue": 1.0,
+                        "ambient": 2.0,
+                    },
+                }
+            }
+        )
+
+        self.assertTrue(model.available)
+        self.assertFalse(model.enabled)
+        self.assertIs(model.toggled_enabled, True)
+        self.assertIsNone(model.stepped_value("robot_light_brightness_lumens_up"))
+
     def test_settings_panel_distinguishes_current_next_and_pending(self) -> None:
         lines = MODULE.settings_hint_lines(
             {

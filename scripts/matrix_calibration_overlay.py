@@ -1162,6 +1162,7 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
         1,
         len(_VIDEO_SETTING_PRESETS)
         + len(_VIDEO_CAMERA_DISTANCE_FIELDS)
+        + 1
         + len(_ROBOT_LIGHTING_PRESETS),
     )
     video_row_height = max(
@@ -1218,8 +1219,15 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
         "video_camera_distance_cm_value"
     ]
     robot_start = len(_VIDEO_SETTING_PRESETS) + len(_VIDEO_CAMERA_DISTANCE_FIELDS)
+    robot_enable_y = video_top + robot_start * (video_row_height + video_row_gap)
+    result[_ROBOT_LIGHTING_ENABLE_ACTION] = (
+        panel_x + margin,
+        robot_enable_y,
+        panel_width - 2 * margin,
+        video_row_height,
+    )
     for index, field in enumerate(_ROBOT_LIGHTING_PRESETS):
-        row_y = video_top + (robot_start + index) * (
+        row_y = video_top + (robot_start + 1 + index) * (
             video_row_height + video_row_gap
         )
         stem = f"robot_light_{field}"
@@ -1501,6 +1509,7 @@ _ROBOT_LIGHTING_LABELS = {
     "blue": "Robot Light Blue",
     "ambient": "Shadow Fill",
 }
+_ROBOT_LIGHTING_ENABLE_ACTION = "robot_light_enabled_toggle"
 _ROBOT_LIGHTING_STEP_ACTION_DETAILS = {
     f"robot_light_{field}_{suffix}": (field, direction)
     for field in _ROBOT_LIGHTING_PRESETS
@@ -1655,6 +1664,7 @@ _PANEL_HIT_TARGETS = (
     + _NATIVE_MODE_HIT_TARGETS
     + _VIDEO_STEP_ACTIONS
     + _ROBOT_LIGHTING_STEP_ACTIONS
+    + (_ROBOT_LIGHTING_ENABLE_ACTION,)
     + _VIDEO_CAMERA_DISTANCE_BOUND_INPUT_ACTIONS
 )
 
@@ -1751,6 +1761,7 @@ def _targets_for_panel_page(
             + ("video_camera_distance_cm_slider",)
             + _VIDEO_STEP_ACTIONS
             + _ROBOT_LIGHTING_STEP_ACTIONS
+            + (_ROBOT_LIGHTING_ENABLE_ACTION,)
             + _VIDEO_CAMERA_DISTANCE_BOUND_INPUT_ACTIONS
         )
         if include_hover_only:
@@ -1849,6 +1860,7 @@ _BASIC_TOOLTIP_LINES = {
     "terminal_opacity_down": ("降低战术终端不透明度；调光照/材质时更容易看见背后机器人。",),
     "terminal_opacity_up": ("提高战术终端不透明度；文字更稳但会更遮挡画面。",),
     "terminal_opacity_value": ("当前战术终端不透明度；修改会立即作用到当前 ESC 面板。",),
+    "robot_light_enabled_toggle": ("取消勾选可回到原版无额外机器人补光；再次勾选恢复局内补光。",),
     "apply_return": ("保存设置并返回游戏；需要重启的设置会安全应用。",),
     "runtime_pause": ("暂停/继续仿真；执行 TP、姿态控制前建议先暂停。",),
     "quit_game": ("结束当前 Matrix 游戏/仿真进程。",),
@@ -3589,9 +3601,24 @@ class RobotLightingPanelModel:
     def value(self, field: str) -> object:
         return dict(self.values)[field]
 
+    @property
+    def enabled(self) -> bool:
+        return dict(self.values).get("enabled") is True
+
+    @property
+    def toggled_enabled(self) -> bool | None:
+        if not self.available or self.error is not None:
+            return None
+        return not self.enabled
+
     def stepped_value(self, action: str) -> object | None:
         detail = _ROBOT_LIGHTING_STEP_ACTION_DETAILS.get(action)
-        if detail is None or not self.available or self.error is not None:
+        if (
+            detail is None
+            or not self.available
+            or self.error is not None
+            or not self.enabled
+        ):
             return None
         field, direction = detail
         presets = _ROBOT_LIGHTING_PRESETS[field]
@@ -3608,6 +3635,10 @@ def _canonical_robot_lighting_mapping(value: object) -> dict[str, object] | None
     if not isinstance(value, dict):
         return None
     result: dict[str, object] = {}
+    enabled = value.get("enabled", True)
+    if type(enabled) is not bool:
+        return None
+    result["enabled"] = enabled
     for field, presets in _ROBOT_LIGHTING_PRESETS.items():
         candidate = value.get(field)
         if candidate in presets and type(candidate) is type(presets[0]):
@@ -3635,9 +3666,13 @@ def robot_lighting_panel_model(state: dict[str, object]) -> RobotLightingPanelMo
         and 0 <= revision < 2**63
     )
     if values is None:
-        values = {
-            field: presets[0] for field, presets in _ROBOT_LIGHTING_PRESETS.items()
-        }
+        values = {"enabled": True}
+        values.update(
+            {
+                field: presets[0]
+                for field, presets in _ROBOT_LIGHTING_PRESETS.items()
+            }
+        )
     return RobotLightingPanelModel(
         available=available,
         revision=revision if type(revision) is int and revision >= 0 else 0,
@@ -4857,9 +4892,12 @@ class PointerActionPublisher:
     ) -> None:
         presets = _ROBOT_LIGHTING_PRESETS.get(field)
         if (
-            presets is None
-            or value not in presets
-            or type(value) is not type(presets[0])
+            not (field == "enabled" and type(value) is bool)
+            and (
+                presets is None
+                or value not in presets
+                or type(value) is not type(presets[0])
+            )
             or type(expected_revision) is not int
             or not 0 <= expected_revision < 2**63
         ):
@@ -8276,6 +8314,25 @@ class X11CalibrationOverlay:
                 centred_in=self._panel_rectangle(layout, f"{stem}_value"),
             )
         self._draw_camera_distance_slider(layout, model)
+        lighting_toggle_enabled = bool(
+            robot_lighting.available and robot_lighting.error is None
+        )
+        lighting_active = robot_lighting.enabled
+        self._draw_button(
+            layout,
+            _ROBOT_LIGHTING_ENABLE_ACTION,
+            (
+                "[x] Extra Robot Fill Light"
+                if lighting_active
+                else "[ ] Original Lighting"
+            ),
+            fill=self._colours[
+                "selected"
+                if lighting_active
+                else ("button" if lighting_toggle_enabled else "disabled")
+            ],
+            disabled=not lighting_toggle_enabled,
+        )
         for field, presets in _ROBOT_LIGHTING_PRESETS.items():
             stem = f"robot_light_{field}"
             current = robot_lighting.value(field)
@@ -8290,6 +8347,7 @@ class X11CalibrationOverlay:
                 enabled = bool(
                     robot_lighting.available
                     and robot_lighting.error is None
+                    and lighting_active
                     and allowed
                 )
                 self._draw_button(
@@ -8310,7 +8368,9 @@ class X11CalibrationOverlay:
                 x=0,
                 y=0,
                 colour=self._colours[
-                    "white" if robot_lighting.available else "muted"
+                    "white"
+                    if robot_lighting.available and lighting_active
+                    else "muted"
                 ],
                 centred_in=self._panel_rectangle(layout, f"{stem}_value"),
             )
@@ -8318,7 +8378,13 @@ class X11CalibrationOverlay:
         robot_status = (
             f" | Robot Light error: {robot_lighting.error}"
             if robot_lighting.error is not None
-            else (" | Robot Light live" if robot_lighting.available else "")
+            else (
+                " | Robot Light live"
+                if robot_lighting.available and lighting_active
+                else " | Original lighting"
+                if robot_lighting.available
+                else ""
+            )
         )
         status = (
             f"保存失败：{model.error}"
@@ -10033,6 +10099,33 @@ class X11CalibrationOverlay:
                         field, _direction = _ROBOT_LIGHTING_STEP_ACTION_DETAILS[action]
                         publisher.publish_robot_lighting_setting(
                             field,
+                            target_value,
+                            expected_revision=robot_lighting.revision,
+                        )
+                        emitted += 1
+                elif action == _ROBOT_LIGHTING_ENABLE_ACTION:
+                    robot_lighting = getattr(self, "_last_robot_lighting_model", None)
+                    panel_model = self._last_panel_model
+                    target_value = (
+                        robot_lighting.toggled_enabled
+                        if robot_lighting is not None
+                        else None
+                    )
+                    if (
+                        target_value is not None
+                        and panel_model is not None
+                        and not panel_model.restart_requested
+                        and panel_model.status != "restarting"
+                        and not self._command_editor.editing
+                        and not self._command_editor.pending
+                        and not self._last_command_status.in_flight
+                        and not self._last_command_status.restart_required
+                        and not self._last_command_status.outcome_unknown
+                        and self._last_command_status.status
+                        not in {"pending", "restarting"}
+                    ):
+                        publisher.publish_robot_lighting_setting(
+                            "enabled",
                             target_value,
                             expected_revision=robot_lighting.revision,
                         )

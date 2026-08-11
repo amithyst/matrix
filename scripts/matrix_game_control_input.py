@@ -187,6 +187,7 @@ _ROBOT_LIGHTING_PRESETS: dict[str, tuple[object, ...]] = {
     "ambient": (0.0, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0),
 }
 _ROBOT_LIGHTING_DEFAULTS = {
+    "enabled": True,
     "brightness_lumens": 8000,
     "contrast": 1.0,
     "red": 1.0,
@@ -194,6 +195,8 @@ _ROBOT_LIGHTING_DEFAULTS = {
     "blue": 1.0,
     "ambient": 2.0,
 }
+_ROBOT_LIGHTING_SETTINGS_SCHEMA = "matrix-robot-lighting-settings/v1"
+_ROBOT_LIGHTING_STATUS_SCHEMA = "zero-matrix-operator-world-status/v1"
 _MOVEMENT_MODE_ACTIONS = frozenset(
     f"movement_mode_{movement_mode}"
     for movement_mode in MOVEMENT_MODES
@@ -750,15 +753,32 @@ def video_settings_live_mapping(
 class RobotLightingController:
     """Send live robot fill-light tuning commands to the ZeroMatrix UE runtime."""
 
-    def __init__(self, *, host: str, port: int) -> None:
+    def __init__(
+        self,
+        *,
+        host: str,
+        port: int,
+        settings_path: Path | None = None,
+        world_status_path: Path | None = None,
+        initial_world: str | None = None,
+    ) -> None:
         self.address = (host, int(port))
         self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.values = dict(_ROBOT_LIGHTING_DEFAULTS)
+        self.settings_path = settings_path
+        self.world_status_path = world_status_path
+        self.active_world = self._canonical_world(initial_world) or "realscan-full"
+        self.values = self._settings_for_world(self.active_world)
         self.revision = 0
         self.error: str | None = None
+        self.persistence_error: str | None = None
+        self._last_world_status_check_s = 0.0
 
     @staticmethod
     def _canonical_value(field: object, value: object) -> object:
+        if field == "enabled":
+            if type(value) is not bool:
+                raise ValueError("unsupported robot lighting enabled value")
+            return value
         if not isinstance(field, str) or field not in _ROBOT_LIGHTING_PRESETS:
             raise ValueError("unsupported robot lighting field")
         presets = _ROBOT_LIGHTING_PRESETS[field]
@@ -766,12 +786,162 @@ class RobotLightingController:
             raise ValueError("unsupported robot lighting value")
         return value
 
+    @staticmethod
+    def _canonical_world(value: object) -> str | None:
+        if not isinstance(value, str):
+            return None
+        world = value.strip().lower()
+        if world in {"town10", "realscan", "realscan-full"}:
+            return world
+        return None
+
+    @classmethod
+    def _default_settings_for_world(cls, world: str) -> dict[str, object]:
+        values = dict(_ROBOT_LIGHTING_DEFAULTS)
+        values["enabled"] = world in {"realscan", "realscan-full"}
+        return values
+
+    @classmethod
+    def _canonical_values(
+        cls,
+        value: object,
+        *,
+        defaults: dict[str, object] | None = None,
+    ) -> dict[str, object] | None:
+        if not isinstance(value, dict):
+            return None
+        result: dict[str, object] = dict(defaults or {})
+        try:
+            result["enabled"] = cls._canonical_value(
+                "enabled",
+                value.get("enabled", result.get("enabled", True)),
+            )
+            for field in _ROBOT_LIGHTING_PRESETS:
+                result[field] = cls._canonical_value(
+                    field,
+                    value.get(field, result.get(field)),
+                )
+        except ValueError:
+            return None
+        return result
+
+    def _load_document(self) -> dict[str, object]:
+        if self.settings_path is None:
+            return {"version": 1, "worlds": {}}
+        try:
+            if (
+                self.settings_path.is_symlink()
+                or self.settings_path.stat().st_size > 256 * 1024
+            ):
+                raise ValueError("robot lighting settings path is unsafe")
+            document = json.loads(self.settings_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {"version": 1, "worlds": {}}
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            self.persistence_error = str(exc)
+            return {"version": 1, "worlds": {}}
+        if not isinstance(document, dict) or document.get("version") != 1:
+            self.persistence_error = "unsupported robot lighting settings version"
+            return {"version": 1, "worlds": {}}
+        worlds = document.get("worlds")
+        if not isinstance(worlds, dict):
+            self.persistence_error = "robot lighting settings worlds must be an object"
+            return {"version": 1, "worlds": {}}
+        self.persistence_error = None
+        return {"version": 1, "worlds": worlds}
+
+    def _settings_for_world(self, world: str) -> dict[str, object]:
+        values = self._default_settings_for_world(world)
+        document = self._load_document()
+        worlds = document.get("worlds")
+        candidate = worlds.get(world) if isinstance(worlds, dict) else None
+        canonical = self._canonical_values(candidate, defaults=values)
+        if canonical is not None:
+            values.update(canonical)
+        return values
+
+    def _save_world_settings(self, world: str, values: dict[str, object]) -> None:
+        if self.settings_path is None:
+            return
+        document = self._load_document()
+        worlds = document.get("worlds")
+        if not isinstance(worlds, dict):
+            worlds = {}
+        worlds[world] = dict(values)
+        try:
+            _atomic_json(
+                self.settings_path,
+                {
+                    "version": 1,
+                    "worlds": worlds,
+                },
+            )
+            self.persistence_error = None
+        except OSError as exc:
+            self.persistence_error = str(exc)
+
+    def _read_active_world(self) -> str | None:
+        if self.world_status_path is None:
+            return None
+        try:
+            if (
+                self.world_status_path.is_symlink()
+                or self.world_status_path.stat().st_size > 128 * 1024
+            ):
+                return None
+            document = json.loads(self.world_status_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        if (
+            not isinstance(document, dict)
+            or document.get("schema") != _ROBOT_LIGHTING_STATUS_SCHEMA
+        ):
+            return None
+        return self._canonical_world(document.get("active_world"))
+
+    def _send_current(self) -> bool:
+        payload = {
+            "schema": _ROBOT_LIGHTING_SCHEMA,
+            "command": "robot_fill_light",
+            "request_id": f"matrix-robot-light-{self.revision + 1}",
+            **self.values,
+        }
+        try:
+            encoded = json.dumps(payload, separators=(",", ":")).encode("ascii")
+            self._socket.sendto(encoded, self.address)
+        except OSError as exc:
+            self.error = str(exc)
+            return False
+        self.revision += 1
+        self.error = None
+        return True
+
+    def apply_active_settings(self) -> bool:
+        return self._send_current()
+
+    def refresh_world(self, now_s: float | None = None) -> bool:
+        if now_s is not None and now_s - self._last_world_status_check_s < 0.25:
+            return False
+        if now_s is not None:
+            self._last_world_status_check_s = now_s
+        world = self._read_active_world()
+        if world is None or world == self.active_world:
+            return False
+        self.active_world = world
+        self.values = self._settings_for_world(world)
+        self._send_current()
+        return True
+
     def live_mapping(self) -> dict[str, object]:
         return {
             "available": True,
             "revision": self.revision,
+            "world": self.active_world,
+            "settings_file": (
+                os.fspath(self.settings_path) if self.settings_path is not None else None
+            ),
             "values": dict(self.values),
-            "error": self.error,
+            "error": first_settings_error(self.error, self.persistence_error),
         }
 
     def apply_intent(
@@ -791,21 +961,9 @@ class RobotLightingController:
             return False
         candidate = dict(self.values)
         candidate[field] = canonical
-        payload = {
-            "schema": _ROBOT_LIGHTING_SCHEMA,
-            "command": "robot_fill_light",
-            "request_id": f"matrix-robot-light-{self.revision + 1}",
-            **candidate,
-        }
-        try:
-            encoded = json.dumps(payload, separators=(",", ":")).encode("ascii")
-            self._socket.sendto(encoded, self.address)
-        except OSError as exc:
-            self.error = str(exc)
-            return True
         self.values = candidate
-        self.revision += 1
-        self.error = None
+        self._save_world_settings(self.active_world, candidate)
+        self._send_current()
         return True
 
     def close(self) -> None:
@@ -5350,9 +5508,15 @@ class CalibrationOverlaySupervisor:
                 presets = _ROBOT_LIGHTING_PRESETS.get(field)
                 robot_value = value.get("value")
                 if (
-                    presets is None
-                    or robot_value not in presets
-                    or type(robot_value) is not type(presets[0])
+                    not (
+                        field == "enabled"
+                        and type(robot_value) is bool
+                    )
+                    and (
+                        presets is None
+                        or robot_value not in presets
+                        or type(robot_value) is not type(presets[0])
+                    )
                 ):
                     raise RuntimeError("invalid robot-lighting intent value")
                 intent = OverlayIntent(
@@ -5880,7 +6044,23 @@ def main() -> int:
     robot_lighting = RobotLightingController(
         host=args.world_command_host,
         port=args.world_command_port,
+        settings_path=(
+            args.video_settings_file.with_name("robot-lighting-settings.json")
+            if args.video_settings_file is not None
+            else None
+        ),
+        world_status_path=(
+            Path(raw_world_status_path)
+            if (raw_world_status_path := os.environ.get("ZERO_MATRIX_OPERATOR_WORLD_STATUS_FILE"))
+            else None
+        ),
+        initial_world=(
+            os.environ.get("ZERO_MATRIX_UE_WORLD")
+            or os.environ.get("ZERO_MATRIX_INITIAL_SCENE")
+        ),
     )
+    robot_lighting.refresh_world()
+    robot_lighting.apply_active_settings()
     keyboard_camera_integrator = KeyboardCameraLookIntegrator()
     engine_camera_worker: EngineCameraLookWorker | None = None
     if args.engine_input_socket is not None:
@@ -6057,6 +6237,7 @@ def main() -> int:
             next_frame = max(next_frame + 1.0 / args.rate_hz, now)
 
             command_state_changed = game_command_client.poll()
+            robot_lighting_changed = robot_lighting.refresh_world(now)
             if (
                 command_state_changed
                 and game_command_client.ok is True
@@ -6136,7 +6317,6 @@ def main() -> int:
             )
             panel_actions: list[str] = []
             panel_font_sizes: list[int] = []
-            robot_lighting_changed = False
             for intent in panel_intents:
                 if intent.kind == "action":
                     assert intent.action is not None
