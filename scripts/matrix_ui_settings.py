@@ -19,6 +19,10 @@ MAX_FONT_SCALE = FONT_SCALE_STEPS[-1]
 MIN_FONT_SIZE = 1
 MAX_FONT_SIZE = 22
 DEFAULT_FONT_SIZE = 13
+PANEL_OPACITY_STEPS = (0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95, 1.0)
+DEFAULT_PANEL_OPACITY = 0.65
+MIN_PANEL_OPACITY = PANEL_OPACITY_STEPS[0]
+MAX_PANEL_OPACITY = PANEL_OPACITY_STEPS[-1]
 _PROFILE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 
 
@@ -87,10 +91,42 @@ def step_font_size(value: object, direction: int) -> int:
     )
 
 
+def canonical_panel_opacity(value: object) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+    ):
+        raise ValueError("panel opacity must be finite and use a supported preset")
+    number = float(value)
+    for preset in PANEL_OPACITY_STEPS:
+        if math.isclose(number, preset, rel_tol=0.0, abs_tol=1e-9):
+            return preset
+    raise ValueError(
+        "panel opacity must use one of: "
+        + ", ".join(f"{preset:.2f}" for preset in PANEL_OPACITY_STEPS)
+    )
+
+
+def step_panel_opacity(value: object, direction: int) -> float:
+    if (
+        isinstance(direction, bool)
+        or not isinstance(direction, int)
+        or direction not in {-1, 1}
+    ):
+        raise ValueError("panel opacity direction must be -1 or 1")
+    canonical = canonical_panel_opacity(value)
+    index = PANEL_OPACITY_STEPS.index(canonical)
+    return PANEL_OPACITY_STEPS[
+        max(0, min(len(PANEL_OPACITY_STEPS) - 1, index + direction))
+    ]
+
+
 @dataclass(frozen=True)
 class UiSettings:
     font_scale: float = DEFAULT_FONT_SCALE
     font_size: int | None = None
+    panel_opacity: float = DEFAULT_PANEL_OPACITY
 
     def __post_init__(self) -> None:
         scale = canonical_font_scale(self.font_scale)
@@ -102,11 +138,18 @@ class UiSettings:
             if self.font_size is None
             else canonical_font_size(self.font_size),
         )
+        object.__setattr__(
+            self,
+            "panel_opacity",
+            canonical_panel_opacity(self.panel_opacity),
+        )
+
     def persisted_mapping(self) -> dict[str, object]:
         return {
-            "version": 2,
+            "version": 3,
             "font_scale": self.font_scale,
             "font_size": self.font_size,
+            "panel_opacity": self.panel_opacity,
         }
 
 
@@ -190,6 +233,21 @@ def load_settings(path: Path) -> SettingsLoad:
             settings = UiSettings(
                 font_scale=value.get("font_scale"),
                 font_size=value.get("font_size"),
+            )
+        elif version == 3:
+            if set(value) != {
+                "version",
+                "font_scale",
+                "font_size",
+                "panel_opacity",
+            }:
+                raise ValueError(
+                    "expected exactly version/font_scale/font_size/panel_opacity"
+                )
+            settings = UiSettings(
+                font_scale=value.get("font_scale"),
+                font_size=value.get("font_size"),
+                panel_opacity=value.get("panel_opacity"),
             )
         else:
             raise ValueError("unsupported settings version")

@@ -75,6 +75,7 @@ from matrix_ui_settings import (
     canonical_font_size,
     load_settings_with_legacy_fallback as load_ui_settings,
     step_font_size,
+    step_panel_opacity,
 )
 from matrix_video_settings import (
     CAMERA_DISTANCE_CM_FIELD,
@@ -197,7 +198,14 @@ _MOVEMENT_MODE_ACTIONS = frozenset(
     f"movement_mode_{movement_mode}"
     for movement_mode in MOVEMENT_MODES
 )
-_UI_PANEL_ACTIONS = frozenset({"font_down", "font_up"})
+_UI_PANEL_ACTIONS = frozenset(
+    {
+        "font_down",
+        "font_up",
+        "terminal_opacity_down",
+        "terminal_opacity_up",
+    }
+)
 _JS_EVENT = struct.Struct("IhBB")
 _JS_EVENT_BUTTON = 0x01
 _JS_EVENT_AXIS = 0x02
@@ -562,11 +570,23 @@ class UiSettingsController:
     def apply_panel_action(self, action: str, *, active: bool) -> bool:
         if not active or action not in _UI_PANEL_ACTIONS:
             return False
-        direction = -1 if action == "font_down" else 1
+        direction = -1 if action.endswith("_down") else 1
+        if action.startswith("terminal_opacity_"):
+            return self._replace(
+                UiSettings(
+                    font_scale=self.desired.font_scale,
+                    font_size=self.desired.font_size,
+                    panel_opacity=step_panel_opacity(
+                        self.desired.panel_opacity,
+                        direction,
+                    ),
+                )
+            )
         return self._replace(
             UiSettings(
                 font_scale=self.desired.font_scale,
                 font_size=step_font_size(self.desired.font_size, direction),
+                panel_opacity=self.desired.panel_opacity,
             )
         )
 
@@ -577,6 +597,7 @@ class UiSettingsController:
             UiSettings(
                 font_scale=self.desired.font_scale,
                 font_size=canonical_font_size(font_size),
+                panel_opacity=self.desired.panel_opacity,
             )
         )
 
@@ -585,6 +606,7 @@ class UiSettingsController:
             "settings_file": os.fspath(self.path) if self.path is not None else None,
             "font_scale": self.desired.font_scale,
             "font_size": self.desired.font_size,
+            "panel_opacity": self.desired.panel_opacity,
             "load_status": self.load_status,
             "persistence_error": self.persistence_error,
             "change_count": self.change_count,

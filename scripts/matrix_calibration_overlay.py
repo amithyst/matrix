@@ -49,10 +49,14 @@ from matrix_game_control import (
 )
 from matrix_ui_settings import (
     DEFAULT_FONT_SCALE,
+    DEFAULT_PANEL_OPACITY,
     MAX_FONT_SIZE,
+    MAX_PANEL_OPACITY,
     MIN_FONT_SIZE,
+    MIN_PANEL_OPACITY,
     canonical_font_scale,
     canonical_font_size,
+    canonical_panel_opacity,
 )
 from matrix_overlay_motion_settings import (
     BFM_TURN_COMMAND_YAW_LIMIT_FIELD,
@@ -86,6 +90,8 @@ from matrix_movement_modes import MOVEMENT_MODES, validate_movement_mode
 _IS_VIEWABLE = 2
 _CW_OVERRIDE_REDIRECT = 1 << 9
 _CW_EVENT_MASK = 1 << 11
+_PROP_MODE_REPLACE = 0
+_XA_CARDINAL = 6
 _SHAPE_BOUNDING = 0
 _SHAPE_INPUT = 2
 _INPUT_ONLY = 2
@@ -523,8 +529,9 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
         // profile_button_count,
     )
     settings_content_width = panel_width - 2 * margin
-    settings_group_width = max(1, (settings_content_width - 2 * gap) // 3)
-    speed_width = max(42, min(112, settings_group_width // 4))
+    settings_group_width = max(1, (settings_content_width - 3 * gap) // 4)
+    min_step_width = 42 if compact else 80
+    speed_width = max(min_step_width, min(112, settings_group_width // 3))
     footer_width = panel_width - 2 * margin
     pause_width = max(108, min(220, (footer_width - 2 * gap) // 4))
     quit_width = max(112, min(240, (footer_width - 2 * gap) // 4))
@@ -548,6 +555,7 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
     )
     cap_left = panel_x + margin + settings_group_width + gap
     font_left = panel_x + margin + 2 * (settings_group_width + gap)
+    opacity_left = panel_x + margin + 3 * (settings_group_width + gap)
     cap_value = (
         cap_left + speed_width,
         speed_y,
@@ -556,6 +564,12 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
     )
     font_value = (
         font_left + speed_width,
+        speed_y,
+        settings_group_width - 2 * speed_width,
+        button_height,
+    )
+    opacity_value = (
+        opacity_left + speed_width,
         speed_y,
         settings_group_width - 2 * speed_width,
         button_height,
@@ -794,6 +808,19 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
         "font_value": font_value,
         "font_up": (
             font_left + settings_group_width - speed_width,
+            speed_y,
+            speed_width,
+            button_height,
+        ),
+        "terminal_opacity_down": (
+            opacity_left,
+            speed_y,
+            speed_width,
+            button_height,
+        ),
+        "terminal_opacity_value": opacity_value,
+        "terminal_opacity_up": (
+            opacity_left + settings_group_width - speed_width,
             speed_y,
             speed_width,
             button_height,
@@ -1266,6 +1293,8 @@ _PANEL_ACTIONS = (
     "speed_up",
     "font_down",
     "font_up",
+    "terminal_opacity_down",
+    "terminal_opacity_up",
     "apply_return",
 )
 
@@ -1633,6 +1662,7 @@ _SETTINGS_VALUE_HOVER_TARGETS = (
     "speed_value",
     "font_value",
     "font_size_slider",
+    "terminal_opacity_value",
 ) + _MOTION_VALUE_HOVER_TARGETS
 
 
@@ -1816,6 +1846,9 @@ _BASIC_TOOLTIP_LINES = {
     "font_up": ("增大 ESC 面板字号。",),
     "font_value": ("当前 ESC 面板字号。",),
     "font_size_slider": ("拖动调整 ESC 面板字号；过大容易挤压布局。",),
+    "terminal_opacity_down": ("降低战术终端不透明度；调光照/材质时更容易看见背后机器人。",),
+    "terminal_opacity_up": ("提高战术终端不透明度；文字更稳但会更遮挡画面。",),
+    "terminal_opacity_value": ("当前战术终端不透明度；修改会立即作用到当前 ESC 面板。",),
     "apply_return": ("保存设置并返回游戏；需要重启的设置会安全应用。",),
     "runtime_pause": ("暂停/继续仿真；执行 TP、姿态控制前建议先暂停。",),
     "quit_game": ("结束当前 Matrix 游戏/仿真进程。",),
@@ -3325,6 +3358,7 @@ class SettingsPanelModel:
     error: str | None
     font_scale: float
     font_size: int
+    panel_opacity: float
 
     @property
     def apply_label(self) -> str:
@@ -3356,6 +3390,14 @@ class SettingsPanelModel:
             return bool(not controls_disabled and self.font_size > MIN_FONT_SIZE)
         if action == "font_up":
             return bool(not controls_disabled and self.font_size < MAX_FONT_SIZE)
+        if action == "terminal_opacity_down":
+            return bool(
+                not controls_disabled and self.panel_opacity > MIN_PANEL_OPACITY
+            )
+        if action == "terminal_opacity_up":
+            return bool(
+                not controls_disabled and self.panel_opacity < MAX_PANEL_OPACITY
+            )
         if action == "apply_return":
             return bool(
                 not controls_disabled
@@ -4568,6 +4610,12 @@ def settings_panel_model(state: dict[str, object]) -> SettingsPanelModel:
         )
     except ValueError:
         font_size = fallback_font_size
+    try:
+        panel_opacity = canonical_panel_opacity(
+            ui_settings.get("panel_opacity", 0.65)
+        )
+    except ValueError:
+        panel_opacity = 0.65
     return SettingsPanelModel(
         current_profile=profile(current.get("profile")),
         current_scale=current_scale,
@@ -4591,6 +4639,7 @@ def settings_panel_model(state: dict[str, object]) -> SettingsPanelModel:
         error=error_value,
         font_scale=font_scale,
         font_size=font_size,
+        panel_opacity=panel_opacity,
     )
 
 
@@ -4953,6 +5002,9 @@ class X11CalibrationOverlay:
         self._pid_atom = int(
             self._x11.XInternAtom(self._display, b"_NET_WM_PID", 0)
         )
+        self._window_opacity_atom = int(
+            self._x11.XInternAtom(self._display, b"_NET_WM_WINDOW_OPACITY", 0)
+        )
         extension_event = ctypes.c_int()
         extension_error = ctypes.c_int()
         if not self._xfixes.XFixesQueryExtension(
@@ -4986,6 +5038,7 @@ class X11CalibrationOverlay:
         self._xft_colours: dict[int, XftColor] = {}
         self._font_size = self._initial_font_size
         self._last_rendered_font_size: int | None = None
+        self._panel_opacity = DEFAULT_PANEL_OPACITY
         self._font_slider_dragging = False
         self._pending_font_slider_action: str | None = None
         self._pending_font_slider_size: int | None = None
@@ -5184,6 +5237,19 @@ class X11CalibrationOverlay:
                     ctypes.c_ulong,
                     ctypes.c_ulong,
                     ctypes.POINTER(XSetWindowAttributes),
+                ],
+                ctypes.c_int,
+            ),
+            "XChangeProperty": (
+                [
+                    ctypes.c_void_p,
+                    ctypes.c_ulong,
+                    ctypes.c_ulong,
+                    ctypes.c_ulong,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.POINTER(ctypes.c_ubyte),
+                    ctypes.c_int,
                 ],
                 ctypes.c_int,
             ),
@@ -5837,6 +5903,8 @@ class X11CalibrationOverlay:
                 if not window:
                     raise RuntimeError(f"cannot create overlay window {name}")
                 self._windows[name] = window
+                if name == "panel":
+                    self._apply_panel_opacity(self._panel_opacity)
                 self._x11.XStoreName(
                     self._display,
                     window,
@@ -5969,6 +6037,36 @@ class X11CalibrationOverlay:
                     self._display,
                     ctypes.c_void_p(previous),
                 )
+        return True
+
+    def _apply_panel_opacity(self, opacity: float) -> None:
+        if not hasattr(self._x11, "XChangeProperty"):
+            return
+        panel = self._windows.get("panel")
+        atom = getattr(self, "_window_opacity_atom", 0)
+        if not panel or not atom:
+            return
+        bounded = max(0.0, min(1.0, float(opacity)))
+        raw = max(0, min(0xFFFFFFFF, int(round(0xFFFFFFFF * bounded))))
+        value = ctypes.c_ulong(raw)
+        self._x11.XChangeProperty(
+            self._display,
+            panel,
+            atom,
+            _XA_CARDINAL,
+            32,
+            _PROP_MODE_REPLACE,
+            ctypes.cast(ctypes.byref(value), ctypes.POINTER(ctypes.c_ubyte)),
+            1,
+        )
+
+    def _set_panel_opacity(self, value: object) -> bool:
+        opacity = canonical_panel_opacity(value)
+        current = getattr(self, "_panel_opacity", DEFAULT_PANEL_OPACITY)
+        if math.isclose(opacity, current, rel_tol=0.0, abs_tol=1e-9):
+            return False
+        self._panel_opacity = opacity
+        self._apply_panel_opacity(opacity)
         return True
 
     @property
@@ -7556,6 +7654,22 @@ class X11CalibrationOverlay:
             fill=self._colours["disabled" if font_up_disabled else "button"],
             disabled=font_up_disabled,
         )
+        opacity_down_disabled = not model.action_enabled("terminal_opacity_down")
+        opacity_up_disabled = not model.action_enabled("terminal_opacity_up")
+        self._draw_button(
+            layout,
+            "terminal_opacity_down",
+            "-",
+            fill=self._colours["disabled" if opacity_down_disabled else "button"],
+            disabled=opacity_down_disabled,
+        )
+        self._draw_button(
+            layout,
+            "terminal_opacity_up",
+            "+",
+            fill=self._colours["disabled" if opacity_up_disabled else "button"],
+            disabled=opacity_up_disabled,
+        )
         for suffix in ("down", "up"):
             action = f"motion_keyboard_speed_cap_{suffix}"
             disabled = bool(
@@ -7592,6 +7706,12 @@ class X11CalibrationOverlay:
             font_value,
             label="界面字体",
             value=f"{model.font_size:d}px",
+        )
+        opacity_value = self._panel_rectangle(layout, "terminal_opacity_value")
+        self._draw_metric_tile(
+            opacity_value,
+            label="终端透明度",
+            value=f"{model.panel_opacity * 100.0:.0f}%",
         )
         compact_motion_labels = bool(
             layout["panel"][2] < 800 or layout["panel"][3] < 600
@@ -9979,6 +10099,7 @@ class X11CalibrationOverlay:
         model = settings_panel_model(state)
         font_changed = self._set_font_scale(model.font_scale)
         size_changed = self._set_font_size(model.font_size)
+        opacity_changed = self._set_panel_opacity(model.panel_opacity)
         motion_model = motion_settings_panel_model(state)
         strategy_model = strategy_loadout_model(state)
         inventory_model = creative_inventory_model(state)
@@ -10001,6 +10122,7 @@ class X11CalibrationOverlay:
         model_changed = bool(
             font_changed
             or size_changed
+            or opacity_changed
             or model != self._last_panel_model
             or motion_model != getattr(self, "_last_motion_model", None)
             or strategy_model != getattr(self, "_last_strategy_model", None)

@@ -673,7 +673,35 @@ class OverlayStateTest(unittest.TestCase):
             "安全重载",
             MODULE.tooltip_lines_for_action("navigation_destination_0")[0],
         )
+        self.assertIn(
+            "不透明度",
+            MODULE.tooltip_lines_for_action("terminal_opacity_value")[0],
+        )
         self.assertEqual(MODULE.tooltip_lines_for_action("unknown_action"), ())
+
+    def test_settings_panel_model_surfaces_terminal_opacity(self) -> None:
+        model = MODULE.settings_panel_model(
+            {
+                "ui_settings": {
+                    "font_scale": 1.0,
+                    "font_size": 13,
+                    "panel_opacity": 0.45,
+                },
+                "restart": {"available": True, "requested": False},
+            }
+        )
+
+        self.assertEqual(model.panel_opacity, 0.45)
+        self.assertTrue(model.action_enabled("terminal_opacity_down"))
+        self.assertTrue(model.action_enabled("terminal_opacity_up"))
+
+        low = MODULE.settings_panel_model(
+            {
+                "ui_settings": {"panel_opacity": 0.35},
+                "restart": {"available": True, "requested": False},
+            }
+        )
+        self.assertFalse(low.action_enabled("terminal_opacity_down"))
 
     def test_settings_panel_distinguishes_current_next_and_pending(self) -> None:
         lines = MODULE.settings_hint_lines(
@@ -791,6 +819,8 @@ class OverlayStateTest(unittest.TestCase):
             "movement_mode_camera_face_strafe",
             "movement_mode_camera_strafe",
             "movement_mode_body_relative",
+            "terminal_opacity_down",
+            "terminal_opacity_up",
             "motion_gait_start_heading_error_down",
             "motion_gait_start_heading_error_up",
             "motion_gait_stop_heading_error_down",
@@ -1547,6 +1577,25 @@ class OverlayRenderCacheTest(unittest.TestCase):
         )
         self.assertEqual(overlay._draw_panel.call_count, 3)
         self.assertIsNone(overlay._draw_panel.call_args.args[-2])
+
+    def test_setting_panel_opacity_updates_x11_window_property(self) -> None:
+        overlay = object.__new__(MODULE.X11CalibrationOverlay)
+        overlay._x11 = mock.Mock()
+        overlay._display = 1
+        overlay._windows = {"panel": 2}
+        overlay._window_opacity_atom = 3
+        overlay._panel_opacity = 0.65
+
+        self.assertTrue(overlay._set_panel_opacity(0.45))
+        self.assertEqual(overlay._panel_opacity, 0.45)
+        overlay._x11.XChangeProperty.assert_called_once()
+        args = overlay._x11.XChangeProperty.call_args.args
+        self.assertEqual(args[:6], (1, 2, 3, MODULE._XA_CARDINAL, 32, 0))
+        self.assertEqual(args[7], 1)
+
+        overlay._x11.XChangeProperty.reset_mock()
+        self.assertFalse(overlay._set_panel_opacity(0.45))
+        overlay._x11.XChangeProperty.assert_not_called()
 
 
 class TargetCacheTest(unittest.TestCase):
