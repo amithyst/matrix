@@ -1183,6 +1183,15 @@ class GameControlCore:
         )
 
         if input_magnitude > 1e-12:
+            if (
+                self._stopped_heading_latched
+                and self._measured_heading_rad is not None
+            ):
+                # A controller/camera turn can finish physically after the
+                # neutral frame that latched the stopped heading. Re-anchor
+                # once when fresh movement resumes so keyboard and gamepad
+                # share the current body heading instead of an old target.
+                self._command_heading_rad = self._measured_heading_rad
             self._stopped_heading_latched = False
             uses_camera_translation_frame = movement_mode in {
                 CAMERA_FACE,

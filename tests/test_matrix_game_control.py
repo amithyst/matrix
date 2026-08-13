@@ -1051,6 +1051,44 @@ class GameControlCoreTest(unittest.TestCase):
             math.radians(25.0),
         )
 
+    def test_new_movement_reanchors_after_neutral_before_camera_turn(self) -> None:
+        core = armed_core(
+            MODULE.ControlConfig(
+                max_speed_mps=0.3,
+                max_acceleration_mps2=100.0,
+                max_deceleration_mps2=100.0,
+                max_turn_rate_rad_s=1.0,
+                max_step_s=0.1,
+            )
+        )
+        core.synchronize_heading(0.0)
+        core.accept_snapshot(snapshot(pressed=("w",)), received_at_s=10.0)
+        core.command(now_s=10.0, dt_s=0.1)
+
+        # The body continues turning after release; the stop latch must hold
+        # the release heading and must not chase this residual feedback.
+        core.accept_snapshot(
+            snapshot(sequence=2, timestamp=10.01), received_at_s=10.01
+        )
+        core.command(now_s=10.01, dt_s=0.02)
+        core.synchronize_heading(math.radians(60.0))
+        core.command(now_s=10.02, dt_s=0.02)
+        self.assertAlmostEqual(core.heading_rad, 0.0)
+
+        # A fresh W starts from the current body heading, then applies the
+        # camera request. It must not continue from the stale release target.
+        core.accept_snapshot(
+            snapshot(sequence=3, timestamp=10.03, yaw=math.radians(60.0), pressed=("w",)),
+            received_at_s=10.03,
+        )
+        resumed = core.command(now_s=10.03, dt_s=0.1)
+        self.assertGreater(resumed.speed_mps, 0.0)
+        self.assertAlmostEqual(
+            math.atan2(resumed.facing[1], resumed.facing[0]),
+            math.radians(60.0),
+            delta=0.1,
+        )
+
     def test_slow_walk_never_publishes_below_native_gait_minimum(self) -> None:
         core = armed_core(
             MODULE.ControlConfig(
