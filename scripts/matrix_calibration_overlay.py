@@ -25,10 +25,12 @@ from pathlib import Path
 import re
 import signal
 import socket
+import struct
 import sys
 import tempfile
 import time
 from typing import Any, Callable
+import zlib
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
@@ -126,6 +128,9 @@ _MAX_INTENT_PACKET_BYTES = 2048
 _MAX_RUNTIME_PAUSE_EPOCH = 2_147_483_647
 _MAX_LOCOMOTION_POLICY_BUTTONS = 3
 _MAX_RECOVERY_POLICY_BUTTONS = 4
+_MAX_NAVIGATION_DESTINATION_BUTTONS = 8
+_NAVIGATION_DESTINATION_COLUMNS = 4
+_MAX_NAVIGATION_DESTINATIONS = 128
 _POLICY_STATUS_DISPLAY_SECONDS = 4.0
 _STARTUP_MEDIA_FRAME_RATE_HZ = 10.0
 _STARTUP_MEDIA_MAX_FRAMES = 2_400
@@ -644,6 +649,7 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
     navigation_summary_bottom = centre_panel_y - safe_half_size - gap
     navigation_summary_height = max(1, navigation_summary_bottom - navigation_top)
     navigation_refresh_width = max(72, min(160, panel_width // 5))
+    navigation_page_width = max(56, min(112, panel_width // 8))
     navigation_refresh_height = max(
         28,
         min(button_height, navigation_summary_height),
@@ -655,17 +661,39 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
         navigation_destinations_bottom - navigation_destinations_top,
     )
     navigation_destination_gap = 6 if compact else 12
+    navigation_destination_rows = (
+        _MAX_NAVIGATION_DESTINATION_BUTTONS
+        + _NAVIGATION_DESTINATION_COLUMNS
+        - 1
+    ) // _NAVIGATION_DESTINATION_COLUMNS
+    navigation_destination_label_height = 0 if compact else 30
+    navigation_destination_grid_top = min(
+        navigation_destinations_bottom,
+        navigation_destinations_top + navigation_destination_label_height,
+    )
+    navigation_destination_grid_height = max(
+        1,
+        navigation_destinations_bottom - navigation_destination_grid_top,
+    )
     navigation_destination_width = max(
         1,
-        (panel_width - 2 * margin - 2 * navigation_destination_gap) // 3,
+        (
+            panel_width
+            - 2 * margin
+            - (_NAVIGATION_DESTINATION_COLUMNS - 1) * navigation_destination_gap
+        )
+        // _NAVIGATION_DESTINATION_COLUMNS,
     )
     navigation_destination_height = max(
-        28,
-        min(button_height, navigation_destinations_height),
-    )
-    navigation_destination_y = max(
-        navigation_destinations_top,
-        navigation_destinations_bottom - navigation_destination_height,
+        1,
+        min(
+            button_height,
+            (
+                navigation_destination_grid_height
+                - (navigation_destination_rows - 1) * navigation_destination_gap
+            )
+            // navigation_destination_rows,
+        ),
     )
     font_slider_width = max(190, min(340, panel_width // 3))
     result = {
@@ -901,6 +929,28 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
             panel_x + panel_width - margin - navigation_refresh_width,
             navigation_top,
             navigation_refresh_width,
+            navigation_refresh_height,
+        ),
+        "navigation_page_previous": (
+            panel_x
+            + panel_width
+            - margin
+            - navigation_refresh_width
+            - 2 * gap
+            - 2 * navigation_page_width,
+            navigation_top,
+            navigation_page_width,
+            navigation_refresh_height,
+        ),
+        "navigation_page_next": (
+            panel_x
+            + panel_width
+            - margin
+            - navigation_refresh_width
+            - gap
+            - navigation_page_width,
+            navigation_top,
+            navigation_page_width,
             navigation_refresh_height,
         ),
         "navigation_destinations": (
@@ -1146,12 +1196,14 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
             button_width,
             motion_row_height,
         )
-    for index in range(3):
+    for index in range(_MAX_NAVIGATION_DESTINATION_BUTTONS):
+        row, column = divmod(index, _NAVIGATION_DESTINATION_COLUMNS)
         result[f"navigation_destination_{index}"] = (
             panel_x
             + margin
-            + index * (navigation_destination_width + navigation_destination_gap),
-            navigation_destination_y,
+            + column * (navigation_destination_width + navigation_destination_gap),
+            navigation_destination_grid_top
+            + row * (navigation_destination_height + navigation_destination_gap),
             navigation_destination_width,
             navigation_destination_height,
         )
@@ -1564,8 +1616,8 @@ _PANEL_DIRECTORY_ENTRIES = (
     ),
     (
         "tab_navigation",
-        "星体导航",
-        "查看目标点并执行导航刷新",
+        "存档导航",
+        "选择地图存档并加载对应地图与独立状态",
         "navigation",
     ),
     (
@@ -1638,10 +1690,13 @@ _POLICY_HIT_TARGETS = tuple(
 )
 _INVENTORY_HIT_TARGETS = tuple(f"creative_item_{index}" for index in range(4))
 _NAVIGATION_DESTINATION_HIT_TARGETS = tuple(
-    f"navigation_destination_{index}" for index in range(3)
+    f"navigation_destination_{index}"
+    for index in range(_MAX_NAVIGATION_DESTINATION_BUTTONS)
 )
 _NAVIGATION_HIT_TARGETS = (
     "navigation_refresh",
+    "navigation_page_previous",
+    "navigation_page_next",
 ) + _NAVIGATION_DESTINATION_HIT_TARGETS
 _PANEL_HIT_TARGETS = (
     _PANEL_TABS
@@ -1872,7 +1927,9 @@ _BASIC_TOOLTIP_LINES = {
     "function_nav_sonic": ("进入 SONIC 原生模式按钮；AUTO 或 4-19 单档。",),
     "function_back": ("返回函数命令的上一级菜单。",),
     "function_run_selected": ("运行当前选中的 .mcfunction 文件。",),
-    "navigation_refresh": ("刷新机器人/场景坐标和可用传送点。",),
+    "navigation_refresh": ("重新扫描 saves/ 并刷新地图存档与当前坐标。",),
+    "navigation_page_previous": ("查看上一页地图存档。",),
+    "navigation_page_next": ("查看更多地图存档。",),
     "video_camera_distance_cm_slider": ("拖动调整相机距离；受距离上下限约束。",),
 }
 
@@ -1982,7 +2039,7 @@ def tooltip_lines_for_action(action: str | None) -> tuple[str, ...]:
     if action.startswith("creative_item_"):
         return ("创造物品：点击后在机器人前方生成调试物体。",)
     if action.startswith("navigation_destination_"):
-        return ("星体导航：点击后安全重载到对应星体/地图；不是无缝切图。",)
+        return ("存档导航：点击后安全加载对应地图与该存档的独立 world-state。",)
     if action.startswith("function_file_"):
         return ("函数文件：点击进入详情页；文件内容可在目录中热编辑。",)
     if action.startswith("function_preset_"):
@@ -2159,6 +2216,110 @@ def read_startup_media_ppm(path: Path) -> StartupMediaFrame:
     if len(payload) != expected:
         raise ValueError("startup media frame pixel payload is truncated")
     return StartupMediaFrame(width=width, height=height, pixels=payload)
+
+
+def read_save_preview_png(path: Path) -> StartupMediaFrame:
+    """Read a bounded non-interlaced 8-bit RGB/RGBA save thumbnail."""
+
+    data = path.read_bytes()
+    if len(data) > 16 * 1024 * 1024 or not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise ValueError("save preview is not a bounded PNG")
+    index = 8
+    width = height = colour_type = None
+    compressed = bytearray()
+    saw_end = False
+    while index + 12 <= len(data):
+        length = struct.unpack(">I", data[index : index + 4])[0]
+        chunk_type = data[index + 4 : index + 8]
+        chunk_end = index + 12 + length
+        if length > 16 * 1024 * 1024 or chunk_end > len(data):
+            raise ValueError("save preview PNG chunk is invalid")
+        payload = data[index + 8 : index + 8 + length]
+        declared_crc = struct.unpack(">I", data[index + 8 + length : chunk_end])[0]
+        if zlib.crc32(chunk_type + payload) & 0xFFFFFFFF != declared_crc:
+            raise ValueError("save preview PNG checksum is invalid")
+        if chunk_type == b"IHDR":
+            if length != 13 or width is not None:
+                raise ValueError("save preview PNG header is invalid")
+            width, height, bit_depth, colour_type, compression, filtering, interlace = (
+                struct.unpack(">IIBBBBB", payload)
+            )
+            if (
+                width <= 0
+                or height <= 0
+                or width * height > _STARTUP_MEDIA_MAX_PIXELS
+                or bit_depth != 8
+                or colour_type not in {2, 6}
+                or compression != 0
+                or filtering != 0
+                or interlace != 0
+            ):
+                raise ValueError("save preview PNG format is unsupported")
+        elif chunk_type == b"IDAT":
+            compressed.extend(payload)
+        elif chunk_type == b"IEND":
+            saw_end = True
+            break
+        index = chunk_end
+    if width is None or height is None or colour_type is None or not compressed or not saw_end:
+        raise ValueError("save preview PNG is incomplete")
+    channels = 3 if colour_type == 2 else 4
+    stride = width * channels
+    expected = (stride + 1) * height
+    decompressor = zlib.decompressobj()
+    raw = decompressor.decompress(bytes(compressed), expected + 1)
+    raw += decompressor.flush()
+    if len(raw) != expected or not decompressor.eof:
+        raise ValueError("save preview PNG pixel payload is invalid")
+
+    previous = bytearray(stride)
+    rgb = bytearray(width * height * 3)
+    source_index = 0
+    target_index = 0
+    for _row in range(height):
+        filter_type = raw[source_index]
+        source_index += 1
+        scanline = bytearray(raw[source_index : source_index + stride])
+        source_index += stride
+        if filter_type not in {0, 1, 2, 3, 4}:
+            raise ValueError("save preview PNG uses an unsupported filter")
+        for offset in range(stride):
+            left = scanline[offset - channels] if offset >= channels else 0
+            up = previous[offset]
+            up_left = previous[offset - channels] if offset >= channels else 0
+            if filter_type == 1:
+                scanline[offset] = (scanline[offset] + left) & 0xFF
+            elif filter_type == 2:
+                scanline[offset] = (scanline[offset] + up) & 0xFF
+            elif filter_type == 3:
+                scanline[offset] = (scanline[offset] + ((left + up) // 2)) & 0xFF
+            elif filter_type == 4:
+                predictor = left + up - up_left
+                pa = abs(predictor - left)
+                pb = abs(predictor - up)
+                pc = abs(predictor - up_left)
+                nearest = left if pa <= pb and pa <= pc else up if pb <= pc else up_left
+                scanline[offset] = (scanline[offset] + nearest) & 0xFF
+        for pixel in range(width):
+            source = pixel * channels
+            red, green, blue = scanline[source : source + 3]
+            if channels == 4:
+                alpha = scanline[source + 3]
+                red = red * alpha // 255
+                green = green * alpha // 255
+                blue = blue * alpha // 255
+            rgb[target_index : target_index + 3] = bytes((red, green, blue))
+            target_index += 3
+        previous = scanline
+    return StartupMediaFrame(width=width, height=height, pixels=bytes(rgb))
+
+
+def read_save_preview(path: Path) -> StartupMediaFrame:
+    if path.suffix.lower() == ".png":
+        return read_save_preview_png(path)
+    if path.suffix.lower() == ".ppm":
+        return read_startup_media_ppm(path)
+    raise ValueError("save preview must be PNG or binary PPM")
 
 
 def startup_loading_model(state: dict[str, object]) -> StartupLoadingModel:
@@ -2522,6 +2683,7 @@ class CelestialDestinationModel:
     universe_position_m: tuple[float, float, float] | None
     gravity_m_s2: float
     atmosphere: str
+    preview_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2559,6 +2721,30 @@ class CelestialNavigationModel:
                 for destination in self.destinations
             )
         )
+
+
+def navigation_page_count(model: CelestialNavigationModel) -> int:
+    """Return the bounded number of save-card pages exposed by the overlay."""
+
+    return max(
+        1,
+        math.ceil(len(model.destinations) / _MAX_NAVIGATION_DESTINATION_BUTTONS),
+    )
+
+
+def navigation_destination_for_slot(
+    model: CelestialNavigationModel,
+    *,
+    page_index: int,
+    slot_index: int,
+) -> CelestialDestinationModel | None:
+    """Resolve a visible save-card slot to the full dynamic destination list."""
+
+    if not 0 <= slot_index < _MAX_NAVIGATION_DESTINATION_BUTTONS:
+        return None
+    page = min(max(0, page_index), navigation_page_count(model) - 1)
+    index = page * _MAX_NAVIGATION_DESTINATION_BUTTONS + slot_index
+    return model.destinations[index] if index < len(model.destinations) else None
 
 
 def _unavailable_celestial_navigation() -> CelestialNavigationModel:
@@ -2735,7 +2921,7 @@ def celestial_navigation_model(state: dict[str, object]) -> CelestialNavigationM
         or not isinstance(bodies_value, list)
         or not 2 <= len(bodies_value) <= 16
         or not isinstance(destinations_value, list)
-        or len(destinations_value) > 8
+        or len(destinations_value) > _MAX_NAVIGATION_DESTINATIONS
     ):
         return fallback
 
@@ -3084,7 +3270,10 @@ def celestial_navigation_model(state: dict[str, object]) -> CelestialNavigationM
     }
     destinations: list[CelestialDestinationModel] = []
     for item in destinations_value:
-        if not isinstance(item, dict) or set(item) != expected_destination:
+        if not isinstance(item, dict) or frozenset(item) not in {
+            frozenset(expected_destination),
+            frozenset(expected_destination | {"preview_path"}),
+        }:
             return fallback
         destination_id = _celestial_identifier(item.get("id"), maximum=64)
         body_id = _celestial_identifier(item.get("body_id"), maximum=64)
@@ -3102,6 +3291,12 @@ def celestial_navigation_model(state: dict[str, object]) -> CelestialNavigationM
         gravity_value = item.get("gravity_m_s2")
         gravity = _celestial_number(gravity_value)
         atmosphere = _celestial_identifier(item.get("atmosphere"), maximum=64)
+        preview_value = item.get("preview_path")
+        preview_path = (
+            _celestial_text(preview_value, maximum=512)
+            if preview_value is not None
+            else None
+        )
         local_value = item.get("local_position_m")
         surface_coordinates = _celestial_vector(
             item.get("surface_coordinates_deg_m")
@@ -3149,6 +3344,7 @@ def celestial_navigation_model(state: dict[str, object]) -> CelestialNavigationM
             or gravity is None
             or not 0.0 < gravity < 100.0
             or atmosphere is None
+            or (preview_value is not None and preview_path is None)
             or surface_coordinates is None
             or not -90.0 <= surface_coordinates[0] <= 90.0
             or not -180.0 <= surface_coordinates[1] <= 180.0
@@ -3185,6 +3381,7 @@ def celestial_navigation_model(state: dict[str, object]) -> CelestialNavigationM
                 universe_position_m=universe_position,
                 gravity_m_s2=gravity,
                 atmosphere=atmosphere,
+                preview_path=preview_path,
             )
         )
     destination_ids = [destination.destination_id for destination in destinations]
@@ -5088,6 +5285,10 @@ class X11CalibrationOverlay:
         self._startup_media_cached_path: str | None = None
         self._startup_media_cached_frame: StartupMediaFrame | None = None
         self._startup_media_colour_cache: dict[tuple[int, int, int], int] = {}
+        self._save_preview_cache: dict[
+            str,
+            tuple[int, int, StartupMediaFrame | None],
+        ] = {}
         self._visible = False
         self._cursor_visible = False
         self._last_layout: dict[str, tuple[int, int, int, int]] | None = None
@@ -5136,6 +5337,7 @@ class X11CalibrationOverlay:
         self._keyboard_grabbed = False
         self._deferred_ungrab_keycode: int | None = None
         self._active_page = _PANEL_DIRECTORY_PAGE
+        self._navigation_page_index = 0
         self._functions_subpage = "home"
         self._selected_function_name: str | None = None
         self._last_functions_subpage: str | None = None
@@ -6401,6 +6603,19 @@ class X11CalibrationOverlay:
             return True
         return False
 
+    def _handle_navigation_page_action(self, action: str | None) -> bool:
+        if action not in {"navigation_page_previous", "navigation_page_next"}:
+            return False
+        navigation = getattr(self, "_last_navigation_model", None)
+        if navigation is None:
+            return True
+        last_page = navigation_page_count(navigation) - 1
+        current = min(max(0, getattr(self, "_navigation_page_index", 0)), last_page)
+        delta = -1 if action == "navigation_page_previous" else 1
+        self._navigation_page_index = min(max(0, current + delta), last_page)
+        self._last_page = None
+        return True
+
     def _queue_polled_left_transition(
         self,
         publisher: PointerActionPublisher,
@@ -6543,10 +6758,14 @@ class X11CalibrationOverlay:
                 self._active_page = next_page
                 if next_page == "functions":
                     self._functions_subpage = "home"
+                if next_page == "navigation":
+                    self._navigation_page_index = 0
                 self._last_page = None
                 self._last_functions_subpage = None
             return emitted
         if self._handle_function_navigation_action(action):
+            return emitted
+        if self._handle_navigation_page_action(action):
             return emitted
         quick_command = self._quick_command_for_current_action(action)
         if quick_command is not None:
@@ -6584,15 +6803,18 @@ class X11CalibrationOverlay:
         if action.startswith("navigation_destination_"):
             navigation = getattr(self, "_last_navigation_model", None)
             try:
-                destination_index = int(action.rsplit("_", 1)[1])
+                slot_index = int(action.rsplit("_", 1)[1])
             except (IndexError, ValueError):
                 return emitted
-            if (
-                navigation is not None
-                and destination_index < len(navigation.destinations)
-            ):
-                destination = navigation.destinations[destination_index]
+            if navigation is not None:
+                destination = navigation_destination_for_slot(
+                    navigation,
+                    page_index=getattr(self, "_navigation_page_index", 0),
+                    slot_index=slot_index,
+                )
                 if (
+                    destination is not None
+                    and
                     navigation.destination_enabled(destination.destination_id)
                     and self._last_command_status.available
                     and not self._last_command_status.in_flight
@@ -7280,7 +7502,7 @@ class X11CalibrationOverlay:
             ("tab_functions", "函数命令", "函数", "functions"),
             ("tab_keybindings", "按键绑定", "按键", "keybindings"),
             ("tab_inventory", "创造物品", "物品", "inventory"),
-            ("tab_navigation", "星体导航", "导航", "navigation"),
+            ("tab_navigation", "存档导航", "存档", "navigation"),
             ("tab_video", "视频设置", "视频", "video"),
             ("tab_system", "运行信息", "运行", "system"),
         ):
@@ -8499,7 +8721,7 @@ class X11CalibrationOverlay:
         if refreshing:
             return "同步中"
         return {
-            "ready": "可传送",
+            "ready": "可进入",
             "unknown": "待同步",
             "undiscovered": "未发现",
             "world_unavailable": "未部署",
@@ -8527,17 +8749,26 @@ class X11CalibrationOverlay:
             outline=self._colours["outline"],
         )
         compact = layout["panel"][2] < 900 or layout["panel"][3] < 650
-        current_body_name = next(
+        current_destination = next(
             (
-                destination.body_name
+                destination
                 for destination in model.destinations
-                if destination.body_id == model.current_body_id
+                if destination.runtime_status == "active"
             ),
-            model.current_body_id or "未知",
+            None,
         )
         refresh = self._panel_rectangle(layout, "navigation_refresh")
-        text_width = max(1, refresh[0] - summary[0] - 12)
-        summary_line = f"{model.display_name} · 当前天体 {current_body_name}"
+        previous = self._panel_rectangle(layout, "navigation_page_previous")
+        text_width = max(1, previous[0] - summary[0] - 12)
+        current_save_name = (
+            current_destination.display_name
+            if current_destination is not None
+            else "未识别"
+        )
+        summary_line = (
+            f"存档导航 · 当前存档 {current_save_name} · "
+            f"{len(model.destinations)} 个地图存档"
+        )
         self._draw_text(
             self._clip_console_line(summary_line, text_width),
             x=summary[0] + 10,
@@ -8581,16 +8812,6 @@ class X11CalibrationOverlay:
                 y=summary[1] + 78,
                 colour=self._colours["cyan"],
             )
-        current_destination = next(
-            (
-                destination
-                for destination in model.destinations
-                if destination.body_id == model.current_body_id
-                and destination.local_position_m is not None
-                and destination.universe_position_m is not None
-            ),
-            None,
-        )
         if not compact and summary[3] >= 140 and current_destination is not None:
             assert current_destination.local_position_m is not None
             assert current_destination.universe_position_m is not None
@@ -8626,42 +8847,79 @@ class X11CalibrationOverlay:
         self._draw_button(
             layout,
             "navigation_refresh",
-            "同步中..." if model.status == "refreshing" else "刷新坐标",
+            "同步中..." if model.status == "refreshing" else "刷新存档",
             fill=self._colours[
                 "disabled" if refresh_disabled else "selected"
             ],
             disabled=refresh_disabled,
         )
+        page_count = navigation_page_count(model)
+        page_index = min(
+            max(0, getattr(self, "_navigation_page_index", 0)),
+            page_count - 1,
+        )
+        if page_index != getattr(self, "_navigation_page_index", 0):
+            self._navigation_page_index = page_index
+        self._draw_button(
+            layout,
+            "navigation_page_previous",
+            "上一页",
+            fill=self._colours["button" if page_index > 0 else "disabled"],
+            disabled=page_index <= 0,
+        )
+        self._draw_button(
+            layout,
+            "navigation_page_next",
+            "下一页",
+            fill=self._colours[
+                "button" if page_index + 1 < page_count else "disabled"
+            ],
+            disabled=page_index + 1 >= page_count,
+        )
 
         destination_band = self._panel_rectangle(layout, "navigation_destinations")
         if not compact and destination_band[3] >= 70:
             self._draw_text(
-                "传送点",
+                f"地图存档 · 第 {page_index + 1}/{page_count} 页",
                 x=destination_band[0],
                 y=destination_band[1] + 20,
                 colour=self._colours["muted"],
             )
         refreshing = model.status == "refreshing"
-        for index, destination in enumerate(model.destinations[:3]):
+        page_start = page_index * _MAX_NAVIGATION_DESTINATION_BUTTONS
+        visible_destinations = model.destinations[
+            page_start : page_start + _MAX_NAVIGATION_DESTINATION_BUTTONS
+        ]
+        for index, destination in enumerate(visible_destinations):
             status_label = self._celestial_status_label(
                 destination.status,
                 refreshing=refreshing,
             )
             enabled = model.destination_enabled(destination.destination_id)
+            save_action = (
+                "当前存档"
+                if destination.runtime_status == "active"
+                else "进入存档"
+            )
             if compact:
-                label = f"{destination.body_name} · {status_label}"
+                label = f"{destination.display_name} · {save_action}"
             else:
                 label = (
-                    f"{destination.body_name} · {destination.display_name} · "
-                    f"{status_label}"
+                    f"{destination.display_name} · {save_action} · {status_label}"
                 )
             rectangle = self._panel_rectangle(
                 layout,
                 f"navigation_destination_{index}",
             )
+            if destination.preview_path:
+                label = "            " + label
             label = self._clip_console_line(label, max(1, rectangle[2] - 8))
             if enabled:
-                fill_name = "apply"
+                fill_name = (
+                    "selected"
+                    if destination.runtime_status == "active"
+                    else "apply"
+                )
             elif refreshing or destination.status == "unknown":
                 fill_name = "pending"
             else:
@@ -8673,9 +8931,10 @@ class X11CalibrationOverlay:
                 fill=self._colours[fill_name],
                 disabled=not enabled,
             )
+            self._draw_save_preview(rectangle, destination.preview_path)
         if not model.destinations:
             self._draw_text(
-                "没有已配置的传送点",
+                "未发现地图存档；将完整存档目录放入 saves/ 后会自动出现",
                 x=0,
                 y=0,
                 colour=self._colours["disabled"],
@@ -8840,6 +9099,103 @@ class X11CalibrationOverlay:
         target[1::4] = source[1::3]
         target[2::4] = source[0::3]
         return bytes(target)
+
+    @staticmethod
+    def _resize_media_frame(
+        frame: StartupMediaFrame,
+        width: int,
+        height: int,
+    ) -> StartupMediaFrame:
+        width = max(1, width)
+        height = max(1, height)
+        target = bytearray(width * height * 3)
+        for target_y in range(height):
+            source_y = min(frame.height - 1, target_y * frame.height // height)
+            for target_x in range(width):
+                source_x = min(frame.width - 1, target_x * frame.width // width)
+                source = (source_y * frame.width + source_x) * 3
+                destination = (target_y * width + target_x) * 3
+                target[destination : destination + 3] = frame.pixels[
+                    source : source + 3
+                ]
+        return StartupMediaFrame(width=width, height=height, pixels=bytes(target))
+
+    def _load_save_preview(self, raw_path: str) -> StartupMediaFrame | None:
+        path = Path(raw_path)
+        try:
+            metadata = path.stat()
+            if path.is_symlink() or not path.is_file() or metadata.st_size > 16 * 1024 * 1024:
+                return None
+        except OSError:
+            return None
+        key = str(path)
+        cached = getattr(self, "_save_preview_cache", {}).get(key)
+        signature = (metadata.st_mtime_ns, metadata.st_size)
+        if cached is not None and cached[:2] == signature:
+            return cached[2]
+        try:
+            frame = read_save_preview(path)
+        except (OSError, ValueError):
+            frame = None
+        cache = getattr(self, "_save_preview_cache", None)
+        if cache is None:
+            cache = {}
+            self._save_preview_cache = cache
+        cache[key] = (signature[0], signature[1], frame)
+        return frame
+
+    def _draw_save_preview(
+        self,
+        rectangle: tuple[int, int, int, int],
+        raw_path: str | None,
+    ) -> bool:
+        if (
+            raw_path is None
+            or not getattr(self, "_visual", None)
+            or getattr(self, "_depth", 0) not in {24, 32}
+            or not hasattr(self._x11, "XCreateImage")
+            or not hasattr(self._x11, "XPutImage")
+        ):
+            return False
+        frame = self._load_save_preview(raw_path)
+        if frame is None:
+            return False
+        x, y, width, height = rectangle
+        preview_width = max(1, min(112, width // 3, width - 8))
+        preview_height = max(1, height - 8)
+        preview = self._resize_media_frame(frame, preview_width, preview_height)
+        image_bytes = self._startup_media_bgrx_bytes(preview)
+        buffer = ctypes.create_string_buffer(image_bytes)
+        image = self._x11.XCreateImage(
+            self._display,
+            self._visual,
+            int(getattr(self, "_depth", 24)),
+            _X11_Z_PIXMAP_FORMAT,
+            0,
+            ctypes.cast(buffer, ctypes.c_void_p),
+            preview.width,
+            preview.height,
+            32,
+            preview.width * 4,
+        )
+        if not image:
+            return False
+        try:
+            self._x11.XPutImage(
+                self._display,
+                self._windows["panel"],
+                ctypes.c_void_p(self._panel_gc),
+                image,
+                0,
+                0,
+                x + 4,
+                y + 4,
+                preview.width,
+                preview.height,
+            )
+        finally:
+            self._x11.XFree(image)
+        return True
 
     def _draw_startup_media_image(
         self,
@@ -9868,10 +10224,14 @@ class X11CalibrationOverlay:
                         self._active_page = next_page
                         if next_page == "functions":
                             self._functions_subpage = "home"
+                        if next_page == "navigation":
+                            self._navigation_page_index = 0
                         self._last_page = None
                         self._last_functions_subpage = None
                     continue
                 if self._handle_function_navigation_action(action):
+                    continue
+                if self._handle_navigation_page_action(action):
                     continue
                 quick_command = self._quick_command_for_current_action(action)
                 if quick_command is not None:
@@ -9952,15 +10312,18 @@ class X11CalibrationOverlay:
                 elif action.startswith("navigation_destination_"):
                     navigation = getattr(self, "_last_navigation_model", None)
                     try:
-                        destination_index = int(action.rsplit("_", 1)[1])
+                        slot_index = int(action.rsplit("_", 1)[1])
                     except (IndexError, ValueError):
                         continue
-                    if (
-                        navigation is not None
-                        and destination_index < len(navigation.destinations)
-                    ):
-                        destination = navigation.destinations[destination_index]
+                    if navigation is not None:
+                        destination = navigation_destination_for_slot(
+                            navigation,
+                            page_index=getattr(self, "_navigation_page_index", 0),
+                            slot_index=slot_index,
+                        )
                         if (
+                            destination is not None
+                            and
                             navigation.destination_enabled(
                                 destination.destination_id
                             )
@@ -10459,6 +10822,7 @@ class X11CalibrationOverlay:
         self._pending_camera_distance_cm = None
         self._last_rendered_font_size = None
         self._active_page = _PANEL_DIRECTORY_PAGE
+        self._navigation_page_index = 0
 
     def close(self) -> None:
         display = getattr(self, "_display", None)
