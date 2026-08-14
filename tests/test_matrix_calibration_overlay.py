@@ -245,6 +245,45 @@ class OverlayLayoutTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "too small"):
             MODULE.overlay_layout(tiny)
 
+    def test_navigation_grid_exposes_eight_bounded_click_targets(self) -> None:
+        for width, height in ((1920, 1080), (1280, 800), (480, 360)):
+            with self.subTest(width=width, height=height):
+                layout = MODULE.overlay_layout(
+                    MODULE.WindowGeometry(1, 0, 0, width, height)
+                )
+                band = layout["navigation_destinations"]
+                buttons = [
+                    layout[f"navigation_destination_{index}"]
+                    for index in range(MODULE._MAX_NAVIGATION_DESTINATION_BUTTONS)
+                ]
+                for index, rectangle in enumerate(buttons):
+                    self.assertTrue(
+                        MODULE.point_in_rectangle(rectangle[:2], band),
+                        msg=f"navigation destination {index} starts outside its band",
+                    )
+                    self.assertTrue(
+                        MODULE.point_in_rectangle(
+                            (
+                                rectangle[0] + rectangle[2] - 1,
+                                rectangle[1] + rectangle[3] - 1,
+                            ),
+                            band,
+                        ),
+                        msg=f"navigation destination {index} ends outside its band",
+                    )
+                    self.assertEqual(
+                        MODULE.panel_action_at(
+                            layout,
+                            rectangle[0] + rectangle[2] // 2,
+                            rectangle[1] + rectangle[3] // 2,
+                            page="navigation",
+                        ),
+                        f"navigation_destination_{index}",
+                    )
+                for index, left in enumerate(buttons):
+                    for right in buttons[index + 1 :]:
+                        self.assertFalse(self.intersects(left, right))
+
     def test_command_input_is_a_separate_hit_target_below_crosshair(self) -> None:
         geometry = MODULE.WindowGeometry(1, 0, 0, 480, 360)
         layout = MODULE.overlay_layout(geometry)

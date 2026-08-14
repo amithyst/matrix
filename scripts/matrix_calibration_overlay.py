@@ -120,6 +120,8 @@ _MAX_INTENT_PACKET_BYTES = 2048
 _MAX_RUNTIME_PAUSE_EPOCH = 2_147_483_647
 _MAX_LOCOMOTION_POLICY_BUTTONS = 3
 _MAX_RECOVERY_POLICY_BUTTONS = 4
+_MAX_NAVIGATION_DESTINATION_BUTTONS = 8
+_NAVIGATION_DESTINATION_COLUMNS = 4
 _POLICY_STATUS_DISPLAY_SECONDS = 4.0
 _STARTUP_MEDIA_FRAME_RATE_HZ = 10.0
 _STARTUP_MEDIA_MAX_FRAMES = 2_400
@@ -641,17 +643,39 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
         navigation_destinations_bottom - navigation_destinations_top,
     )
     navigation_destination_gap = 6 if compact else 12
+    navigation_destination_rows = (
+        _MAX_NAVIGATION_DESTINATION_BUTTONS
+        + _NAVIGATION_DESTINATION_COLUMNS
+        - 1
+    ) // _NAVIGATION_DESTINATION_COLUMNS
+    navigation_destination_label_height = 0 if compact else 30
+    navigation_destination_grid_top = min(
+        navigation_destinations_bottom,
+        navigation_destinations_top + navigation_destination_label_height,
+    )
+    navigation_destination_grid_height = max(
+        1,
+        navigation_destinations_bottom - navigation_destination_grid_top,
+    )
     navigation_destination_width = max(
         1,
-        (panel_width - 2 * margin - 2 * navigation_destination_gap) // 3,
+        (
+            panel_width
+            - 2 * margin
+            - (_NAVIGATION_DESTINATION_COLUMNS - 1) * navigation_destination_gap
+        )
+        // _NAVIGATION_DESTINATION_COLUMNS,
     )
     navigation_destination_height = max(
-        28,
-        min(button_height, navigation_destinations_height),
-    )
-    navigation_destination_y = max(
-        navigation_destinations_top,
-        navigation_destinations_bottom - navigation_destination_height,
+        1,
+        min(
+            button_height,
+            (
+                navigation_destination_grid_height
+                - (navigation_destination_rows - 1) * navigation_destination_gap
+            )
+            // navigation_destination_rows,
+        ),
     )
     font_slider_width = max(190, min(340, panel_width // 3))
     result = {
@@ -1119,12 +1143,14 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
             button_width,
             motion_row_height,
         )
-    for index in range(3):
+    for index in range(_MAX_NAVIGATION_DESTINATION_BUTTONS):
+        row, column = divmod(index, _NAVIGATION_DESTINATION_COLUMNS)
         result[f"navigation_destination_{index}"] = (
             panel_x
             + margin
-            + index * (navigation_destination_width + navigation_destination_gap),
-            navigation_destination_y,
+            + column * (navigation_destination_width + navigation_destination_gap),
+            navigation_destination_grid_top
+            + row * (navigation_destination_height + navigation_destination_gap),
             navigation_destination_width,
             navigation_destination_height,
         )
@@ -1549,7 +1575,8 @@ _POLICY_HIT_TARGETS = tuple(
 )
 _INVENTORY_HIT_TARGETS = tuple(f"creative_item_{index}" for index in range(4))
 _NAVIGATION_DESTINATION_HIT_TARGETS = tuple(
-    f"navigation_destination_{index}" for index in range(3)
+    f"navigation_destination_{index}"
+    for index in range(_MAX_NAVIGATION_DESTINATION_BUTTONS)
 )
 _NAVIGATION_HIT_TARGETS = (
     "navigation_refresh",
@@ -8264,7 +8291,9 @@ class X11CalibrationOverlay:
                 colour=self._colours["muted"],
             )
         refreshing = model.status == "refreshing"
-        for index, destination in enumerate(model.destinations[:3]):
+        for index, destination in enumerate(
+            model.destinations[:_MAX_NAVIGATION_DESTINATION_BUTTONS]
+        ):
             status_label = self._celestial_status_label(
                 destination.status,
                 refreshing=refreshing,
