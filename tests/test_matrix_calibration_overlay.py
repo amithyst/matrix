@@ -283,6 +283,74 @@ class OverlayLayoutTest(unittest.TestCase):
                 for index, left in enumerate(buttons):
                     for right in buttons[index + 1 :]:
                         self.assertFalse(self.intersects(left, right))
+                for action in ("navigation_page_previous", "navigation_page_next"):
+                    x, y, width, height = layout[action]
+                    self.assertEqual(
+                        MODULE.panel_action_at(
+                            layout,
+                            x + width // 2,
+                            y + height // 2,
+                            page="navigation",
+                        ),
+                        action,
+                    )
+
+    def test_navigation_pages_resolve_dynamic_save_slots_without_button_ids(self) -> None:
+        def destination(index: int) -> object:
+            return MODULE.CelestialDestinationModel(
+                destination_id=f"save-{index}",
+                body_id="earth",
+                body_name="地球",
+                display_name=f"地图存档 {index}",
+                teleport_tag=f"world:save-{index}",
+                runtime_status="active" if index == 0 else "reference",
+                status="ready",
+                enabled=True,
+                surface_coordinates_deg_m=(0.0, 0.0, 0.0),
+                surface_heading_deg=0.0,
+                local_position_m=(0.0, 0.0, 0.8),
+                site_universe_position_m=(0.0, 0.0, 0.0),
+                universe_position_m=(0.0, 0.0, 0.0),
+                gravity_m_s2=9.80665,
+                atmosphere="terrestrial",
+            )
+
+        model = MODULE.CelestialNavigationModel(
+            available=True,
+            status="ready",
+            universe_id="sol",
+            display_name="SOL",
+            reference_epoch_utc=None,
+            time_scale=None,
+            frame=None,
+            ephemeris_provider=None,
+            ephemeris_accuracy=None,
+            ephemeris_upgrade_target=None,
+            simulation_time=None,
+            origin_rebasing=True,
+            simulation_local_bound_m=100.0,
+            current_body_id="earth",
+            bodies=(),
+            lighting=None,
+            destinations=tuple(destination(index) for index in range(9)),
+        )
+
+        self.assertEqual(MODULE.navigation_page_count(model), 2)
+        self.assertEqual(
+            MODULE.navigation_destination_for_slot(
+                model,
+                page_index=1,
+                slot_index=0,
+            ).destination_id,
+            "save-8",
+        )
+        self.assertIsNone(
+            MODULE.navigation_destination_for_slot(
+                model,
+                page_index=1,
+                slot_index=1,
+            )
+        )
 
     def test_command_input_is_a_separate_hit_target_below_crosshair(self) -> None:
         geometry = MODULE.WindowGeometry(1, 0, 0, 480, 360)
@@ -667,6 +735,7 @@ class OverlayStateTest(unittest.TestCase):
         ]
         self.assertIn("策略装配", directory_labels)
         self.assertIn("SONIC模式", directory_labels)
+        self.assertIn("存档导航", directory_labels)
         self.assertIn("运行信息", directory_labels)
         self.assertNotIn("返回目录", directory_labels)
         directory_overlay._draw_tabs.assert_not_called()
@@ -679,6 +748,30 @@ class OverlayStateTest(unittest.TestCase):
         self.assertIn("返回目录", settings_labels)
         self.assertNotIn("策略装配", settings_labels)
         settings_overlay._draw_tabs.assert_not_called()
+
+    def test_save_preview_png_decoder_accepts_bounded_rgb_thumbnail(self) -> None:
+        def chunk(kind: bytes, payload: bytes) -> bytes:
+            return (
+                MODULE.struct.pack(">I", len(payload))
+                + kind
+                + payload
+                + MODULE.struct.pack(">I", MODULE.zlib.crc32(kind + payload) & 0xFFFFFFFF)
+            )
+
+        pixels = b"\x00\xff\x00\x00\x00\xff\x00"
+        png = (
+            b"\x89PNG\r\n\x1a\n"
+            + chunk("IHDR".encode(), MODULE.struct.pack(">IIBBBBB", 2, 1, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", MODULE.zlib.compress(pixels))
+            + chunk(b"IEND", b"")
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "preview.png"
+            path.write_bytes(png)
+            frame = MODULE.read_save_preview(path)
+
+        self.assertEqual((frame.width, frame.height), (2, 1))
+        self.assertEqual(frame.pixels, b"\xff\x00\x00\x00\xff\x00")
 
     def test_hover_tooltips_explain_buttons_without_inline_comments(self) -> None:
         self.assertIn(
@@ -709,7 +802,7 @@ class OverlayStateTest(unittest.TestCase):
         )
         self.assertEqual(MODULE.tooltip_lines_for_action("native_mode_1"), ())
         self.assertIn(
-            "安全重载",
+            "独立 world-state",
             MODULE.tooltip_lines_for_action("navigation_destination_0")[0],
         )
         self.assertIn(
